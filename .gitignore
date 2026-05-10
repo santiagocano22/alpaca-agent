@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Trading bot
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/

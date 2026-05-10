@@ -1,0 +1,21 @@
+[project]
+name = "trading-agent"
+version = "0.1.0"
+description = "Automated trading bot: Alpaca execution, Telegram control, Claude-powered strategy parsing"
+requires-python = ">=3.11,<3.13"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = [
+    "error::DeprecationWarning",
+    "ignore::DeprecationWarning:websockets.legacy",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
