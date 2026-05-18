@@ -361,6 +361,26 @@ class AlpacaClient:
         raw_days = await self._with_retry(lambda: self._tc.get_calendar(req))
         return [_map_calendar_day(day) for day in raw_days]
 
+    async def close_position(self, symbol: str) -> None:
+        """Close an open position for ``symbol`` with a market order.
+
+        Uses Alpaca's ``DELETE /v2/positions/{symbol}`` endpoint which submits
+        a market order to liquidate the full position.  No-op when the position
+        does not exist (404 is silently ignored).
+        """
+        if self._settings.dry_run:
+            logger.info("dry_run: close_position({}) suppressed", symbol)
+            return
+        try:
+            await self._call(lambda: self._tc.close_position(symbol))
+            logger.info("close_position: liquidation order submitted for {}", symbol)
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(exc, "status_code", None)
+            if status == 404:
+                logger.info("close_position: no open position for {} (404 ignored)", symbol)
+                return
+            raise self._map_exc(exc, symbol=symbol) from exc
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     async def _call(self, fn, *, symbol: str | None = None):

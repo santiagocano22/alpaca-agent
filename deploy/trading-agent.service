@@ -1,0 +1,40 @@
+[Unit]
+Description=Alpaca Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trading-agent
+Group=trading-agent
+WorkingDirectory=/opt/trading-agent
+
+# Secrets are kept outside the repo, in a root-readable-only file
+EnvironmentFile=/etc/trading-agent/.env
+
+ExecStart=/opt/trading-agent/.venv/bin/python -m src.main
+
+# Restart on failure with back-off; don't restart on clean exit (exit 0)
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Write logs to journald (view with: journalctl -u trading-agent -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-agent
+
+# Hard resource limits — adjust for your VM
+MemoryMax=512M
+CPUWeight=50
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/opt/trading-agent
+
+[Install]
+WantedBy=multi-user.target
