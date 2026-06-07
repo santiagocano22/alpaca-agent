@@ -138,6 +138,7 @@ def _make_session_factory(session=None):
         mock_session = session or MagicMock()
         mock_session.add = MagicMock()
         mock_session.commit = AsyncMock()
+        mock_session.execute = AsyncMock(return_value=MagicMock())
         yield mock_session
     return _factory
 

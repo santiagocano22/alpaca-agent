@@ -96,6 +96,9 @@ class BotDeps:
     pending_strategy_ttl_seconds: int = 600
     """Seconds a parsed strategy remains pending before it expires (default 10 min)."""
 
+    bars_cache: dict = field(default_factory=dict)
+    """Per-symbol rolling DataFrame of historical bars used by the strategy engine."""
+
 
 # ── Application factory ───────────────────────────────────────────────────────
 

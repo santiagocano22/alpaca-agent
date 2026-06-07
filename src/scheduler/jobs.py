@@ -66,13 +66,49 @@ async def _load_warmup_bars(
 
     Returns a DataFrame (may be empty on error; caller handles InsufficientHistoryError).
     """
-    fetch_count = int(required_bars * _WARMUP_BARS_SAFETY_MULTIPLIER) + 1
+    from datetime import UTC, datetime, timedelta
+
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+    fetch_count = int(required_bars * _WARMUP_BARS_SAFETY_MULTIPLIER) + 1  # noqa: F841
+
+    # Map strategy timeframe string → calendar days to look back
+    _DAYS_BACK = {"1D": 600, "1H": 30, "15Min": 10, "5Min": 4, "1Min": 2}
+    days_back = _DAYS_BACK.get(timeframe_str, 600)
+
+    # Map strategy timeframe string → AlpacaTimeFrame
+    _TF_MAP = {
+        "1D": TimeFrame.Day,
+        "1H": TimeFrame.Hour,
+        "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+        "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+        "1Min": TimeFrame.Minute,
+    }
+    tf = _TF_MAP.get(timeframe_str, TimeFrame.Day)
+
+    end = datetime.now(UTC)
+    start = end - timedelta(days=days_back)
+
     try:
-        bars = await alpaca.get_bars(symbol, timeframe=timeframe_str, limit=fetch_count)
-        logger.info(
-            "Warmup: fetched {} bars for {} (needed {})", len(bars), symbol, required_bars
+        bar_list = await alpaca.get_bars(symbol, start=start, end=end, timeframe=tf)
+        if not bar_list:
+            logger.warning("Warmup: no bars returned for {}", symbol)
+            return pd.DataFrame()
+        df = pd.DataFrame(
+            [
+                {
+                    "open": b.open,
+                    "high": b.high,
+                    "low": b.low,
+                    "close": b.close,
+                    "volume": b.volume,
+                }
+                for b in bar_list
+            ],
+            index=pd.DatetimeIndex([b.timestamp for b in bar_list]),
         )
-        return bars
+        logger.info("Warmup: fetched {} bars for {} (needed {})", len(df), symbol, required_bars)
+        return df
     except Exception as exc:  # noqa: BLE001
         logger.error("Warmup: failed to fetch bars for {}: {}", symbol, exc)
         return pd.DataFrame()
@@ -119,7 +155,9 @@ async def warmup_job(
     tf = state.active_strategy.timeframe.value
 
     for symbol in state.active_strategy.universe:
-        await _load_warmup_bars(deps.alpaca, symbol, tf, needed)
+        df = await _load_warmup_bars(deps.alpaca, symbol, tf, needed)
+        if not df.empty:
+            deps.bars_cache[symbol] = df
 
 
 async def open_job(
@@ -151,6 +189,61 @@ async def close_job(
                 logger.info("EOD: closed position {}", pos.symbol)
         except Exception as exc:  # noqa: BLE001
             logger.error("EOD close_all error: {}", exc)
+
+    # For daily strategies: fetch today's completed bar and evaluate entry/exit signals
+    if (
+        state.active_strategy is not None
+        and state.active_strategy.timeframe.value == "1D"
+        and not state.bot_paused
+    ):
+        from datetime import UTC, datetime, timedelta
+
+        from alpaca.data.timeframe import TimeFrame
+
+        from src.broker.schemas import RiskOverrides
+
+        engine = StrategyEngine(state.active_strategy)
+        overrides = RiskOverrides()
+        today_end = datetime.now(UTC)
+        today_start = today_end - timedelta(hours=24)
+
+        for symbol in state.active_strategy.universe:
+            try:
+                bar_list = await deps.alpaca.get_bars(
+                    symbol, start=today_start, end=today_end, timeframe=TimeFrame.Day
+                )
+                if not bar_list:
+                    continue
+                last_bar = bar_list[-1]
+                new_row = pd.DataFrame(
+                    [
+                        {
+                            "open": last_bar.open,
+                            "high": last_bar.high,
+                            "low": last_bar.low,
+                            "close": last_bar.close,
+                            "volume": last_bar.volume,
+                        }
+                    ],
+                    index=pd.DatetimeIndex([last_bar.timestamp]),
+                )
+                existing = deps.bars_cache.get(symbol, pd.DataFrame())
+                deps.bars_cache[symbol] = pd.concat([existing, new_row]).tail(
+                    engine.required_lookback_bars() * 2
+                )
+                bars = deps.bars_cache[symbol]
+                await _evaluate_symbol(
+                    symbol=symbol,
+                    bars=bars,
+                    state=state,
+                    deps=deps,
+                    notify=notify,
+                    engine=engine,
+                    overrides=overrides,
+                    calendar=None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("close_job: error evaluating {} signals: {}", symbol, exc)
 
     state.market_state = "IDLE"
     logger.info("Market closed — transitioning to IDLE")
@@ -239,63 +332,34 @@ async def healthcheck_job(
 # ── Bar event evaluation ───────────────────────────────────────────────────────
 
 
-async def on_bar_event(
-    bar_event: BarEvent,
+async def _evaluate_symbol(
+    symbol: str,
+    bars: pd.DataFrame,
     state: BotState,
     deps: BotDeps,
     notify: NotifyFn,
     engine: StrategyEngine,
-    bars_cache: dict[str, pd.DataFrame],
     overrides: RiskOverrides | None = None,
     calendar: CalendarCache | None = None,
 ) -> None:
-    """Evaluate entry/exit rules on a new OHLCV bar and submit orders if warranted.
+    """Evaluate entry/exit rules for one symbol and submit orders if warranted.
 
-    Called by the StreamManager callback for every completed bar.
+    Shared by ``on_bar_event`` (stream bars) and ``close_job`` (daily REST bars).
+    The caller is responsible for updating ``deps.bars_cache`` before calling this.
 
     Args:
-        bar_event:   The received BarEvent (symbol + OHLCV data).
-        state:       BotState — must be ACTIVE and not paused.
-        deps:        BotDeps with alpaca and session_factory.
-        notify:      Async callable to send Telegram trade notification.
-        engine:      StrategyEngine loaded with the active strategy.
-        bars_cache:  Per-symbol rolling DataFrame of historical bars.  Updated in-place.
-        overrides:   Active risk overrides (may be None).
-        calendar:    CalendarCache for risk_manager check 3.
+        symbol:    Ticker to evaluate.
+        bars:      Full bars DataFrame for this symbol (updated by caller).
+        state:     BotState — must be ACTIVE and not paused (caller enforces).
+        deps:      BotDeps with alpaca and session_factory.
+        notify:    Async callable to send Telegram trade notification.
+        engine:    StrategyEngine loaded with the active strategy.
+        overrides: Active risk overrides (may be None).
+        calendar:  CalendarCache for risk_manager check 3.
     """
-    if state.market_state != "ACTIVE":
-        return
-    if state.bot_paused:
-        return
-    if state.active_strategy is None:
-        return
-
-    symbol = bar_event.bar.symbol
-
-    # Update in-memory bars cache with the new bar
-    new_row = pd.DataFrame(
-        [
-            {
-                "open": bar_event.bar.open,
-                "high": bar_event.bar.high,
-                "low": bar_event.bar.low,
-                "close": bar_event.bar.close,
-                "volume": bar_event.bar.volume,
-            }
-        ],
-        index=pd.DatetimeIndex([bar_event.bar.timestamp]),
-    )
-    existing = bars_cache.get(symbol, pd.DataFrame())
-    bars_cache[symbol] = pd.concat([existing, new_row]).tail(
-        engine.required_lookback_bars() * 2
-    )
-    bars = bars_cache[symbol]
-
     try:
         # ── Exit check ────────────────────────────────────────────────────────
-        # Check exit first (reduce existing position before opening new one)
-        # For now, position info comes from Alpaca; we fetch only on bar event.
-        # A cache could be added here for performance if needed.
+        # Check exit first (reduce existing position before opening new one).
         positions = await deps.alpaca.get_positions()
         position = next((p for p in positions if p.symbol == symbol), None)
 
@@ -348,7 +412,7 @@ async def on_bar_event(
         last_price = float(bars["close"].iloc[-1])
         qty = target_value / last_price if last_price > 0 else 0
         if qty <= 0:
-            logger.warning("on_bar_event: computed qty=0 for {} — skipping", symbol)
+            logger.warning("_evaluate_symbol: computed qty=0 for {} — skipping", symbol)
             return
 
         intent = OrderIntent(
@@ -388,7 +452,75 @@ async def on_bar_event(
                 )
 
     except Exception as exc:  # noqa: BLE001
-        logger.error("on_bar_event error for {}: {}", symbol, exc)
+        logger.error("_evaluate_symbol error for {}: {}", symbol, exc)
+
+
+async def on_bar_event(
+    bar_event: BarEvent,
+    state: BotState,
+    deps: BotDeps,
+    notify: NotifyFn,
+    engine: StrategyEngine,
+    overrides: RiskOverrides | None = None,
+    calendar: CalendarCache | None = None,
+) -> None:
+    """Evaluate entry/exit rules on a new OHLCV bar and submit orders if warranted.
+
+    Called by the StreamManager callback for every completed bar (minute bars
+    from the WebSocket stream).  Daily strategies are evaluated in ``close_job``
+    via REST instead, so this function skips them.
+
+    Args:
+        bar_event:  The received BarEvent (symbol + OHLCV data).
+        state:      BotState — must be ACTIVE and not paused.
+        deps:       BotDeps with alpaca, session_factory, and bars_cache.
+        notify:     Async callable to send Telegram trade notification.
+        engine:     StrategyEngine loaded with the active strategy.
+        overrides:  Active risk overrides (may be None).
+        calendar:   CalendarCache for risk_manager check 3.
+    """
+    if state.market_state != "ACTIVE":
+        return
+    if state.bot_paused:
+        return
+    if state.active_strategy is None:
+        return
+
+    # Daily strategies are evaluated in close_job via REST, not via stream bars
+    if state.active_strategy.timeframe.value == "1D":
+        return
+
+    symbol = bar_event.bar.symbol
+
+    # Update in-memory bars cache with the new bar
+    new_row = pd.DataFrame(
+        [
+            {
+                "open": bar_event.bar.open,
+                "high": bar_event.bar.high,
+                "low": bar_event.bar.low,
+                "close": bar_event.bar.close,
+                "volume": bar_event.bar.volume,
+            }
+        ],
+        index=pd.DatetimeIndex([bar_event.bar.timestamp]),
+    )
+    existing = deps.bars_cache.get(symbol, pd.DataFrame())
+    deps.bars_cache[symbol] = pd.concat([existing, new_row]).tail(
+        engine.required_lookback_bars() * 2
+    )
+    bars = deps.bars_cache[symbol]
+
+    await _evaluate_symbol(
+        symbol=symbol,
+        bars=bars,
+        state=state,
+        deps=deps,
+        notify=notify,
+        engine=engine,
+        overrides=overrides,
+        calendar=calendar,
+    )
 
 
 def _make_order_attempt(intent: OrderIntent) -> OrderAttempt:

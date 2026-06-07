@@ -114,7 +114,7 @@ def _make_position(symbol: str = "AAPL", qty: float = 10.0) -> MagicMock:
     return pos
 
 
-def _make_deps(*, alpaca=None) -> BotDeps:
+def _make_deps(*, alpaca=None, bars_cache: dict | None = None) -> BotDeps:
     @asynccontextmanager
     async def _factory():
         mock_session = MagicMock()
@@ -132,6 +132,7 @@ def _make_deps(*, alpaca=None) -> BotDeps:
         session_factory=_factory,
         llm_client=llm,
         authorized_chat_id=123456,
+        bars_cache=bars_cache if bars_cache is not None else {},
     )
 
 
@@ -395,7 +396,6 @@ async def test_on_bar_event_market_not_active_skips():
     state = BotState(market_state="IDLE", active_strategy=_make_strategy())
     deps = _make_deps()
     engine = StrategyEngine(_make_strategy())
-    bars_cache: dict = {}
     messages = []
 
     await on_bar_event(
@@ -404,7 +404,6 @@ async def test_on_bar_event_market_not_active_skips():
         deps=deps,
         notify=messages.append,
         engine=engine,
-        bars_cache=bars_cache,
     )
 
     assert len(messages) == 0
@@ -423,7 +422,6 @@ async def test_on_bar_event_paused_skips():
         deps=deps,
         notify=messages.append,
         engine=engine,
-        bars_cache={},
     )
 
     assert len(messages) == 0
@@ -442,7 +440,6 @@ async def test_on_bar_event_no_strategy_skips():
         deps=deps,
         notify=messages.append,
         engine=engine,
-        bars_cache={},
     )
 
     assert len(messages) == 0
@@ -473,7 +470,7 @@ async def test_on_bar_event_entry_fires_when_rsi_low():
 
     alpaca = _make_alpaca(positions=[])  # no existing positions
     state = BotState(market_state="ACTIVE", bot_paused=False, active_strategy=strategy)
-    deps = _make_deps(alpaca=alpaca)
+    deps = _make_deps(alpaca=alpaca, bars_cache=bars_cache)
     messages = []
 
     async def notify(text):
@@ -486,7 +483,6 @@ async def test_on_bar_event_entry_fires_when_rsi_low():
         deps=deps,
         notify=notify,
         engine=engine,
-        bars_cache=bars_cache,
     )
 
     # Either an entry fired (message with BUY) or risk manager blocked it
@@ -516,7 +512,7 @@ async def test_on_bar_event_no_signal_no_order():
 
     alpaca = _make_alpaca(positions=[])
     state = BotState(market_state="ACTIVE", bot_paused=False, active_strategy=strategy)
-    deps = _make_deps(alpaca=alpaca)
+    deps = _make_deps(alpaca=alpaca, bars_cache=bars_cache)
 
     await on_bar_event(
         bar_event=_bar_event("AAPL", close=150.0),
@@ -524,7 +520,6 @@ async def test_on_bar_event_no_signal_no_order():
         deps=deps,
         notify=_no_notify,
         engine=engine,
-        bars_cache=bars_cache,
     )
 
     alpaca.submit_order.assert_not_called()

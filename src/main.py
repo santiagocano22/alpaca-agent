@@ -192,8 +192,6 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
     from src.scheduler.jobs import on_bar_event
     from src.strategy.engine import StrategyEngine
 
-    bars_cache: dict = {}
-
     def _get_engine() -> StrategyEngine | None:
         if state.active_strategy is None:
             return None
@@ -209,7 +207,6 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
             deps=deps,
             notify=notify,
             engine=eng,
-            bars_cache=bars_cache,
             calendar=calendar,
         )
 

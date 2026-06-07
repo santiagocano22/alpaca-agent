@@ -279,11 +279,38 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
+    from src.telegram_bot.bot import BotDeps
+    deps: BotDeps = context.bot_data["deps"]
+
     old_name = state.active_strategy.name if state.active_strategy else "ninguna"
     state.active_strategy = state.pending_strategy
     state.pending_strategy = None
     state.pending_strategy_expires_at = None
     state.pending_strategy_raw = ""
+
+    # Persist to DB so strategy survives restarts
+    from sqlalchemy import update as sa_update
+
+    from src.storage.models import StrategyVersion
+
+    try:
+        async with deps.session_factory() as db:
+            # Deactivate previous active strategies
+            await db.execute(
+                sa_update(StrategyVersion).where(StrategyVersion.is_active.is_(True)).values(is_active=False)
+            )
+            # Save new strategy
+            new_version = StrategyVersion(
+                name=state.active_strategy.name,
+                parsed_config=state.active_strategy.model_dump(mode="json"),
+                raw_input=state.pending_strategy_raw or "",
+                is_active=True,
+            )
+            db.add(new_version)
+            await db.commit()
+        logger.info("Strategy '{}' persisted to DB", state.active_strategy.name)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to persist strategy to DB: {}", exc)
 
     await _reply(
         update, context,
