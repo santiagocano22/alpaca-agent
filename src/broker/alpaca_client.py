@@ -41,6 +41,7 @@ from datetime import UTC, date, datetime
 from typing import TypeVar
 from zoneinfo import ZoneInfo
 
+from alpaca.data.enums import DataFeed
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame as AlpacaTimeFrame
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
@@ -317,6 +318,7 @@ class AlpacaClient:
             end=end,
             timeframe=tf,
             limit=10000,
+            feed=DataFeed.IEX,
         )
 
         bar_set = await self._with_retry(
