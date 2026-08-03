@@ -133,6 +133,22 @@ def test_subscribe_bars_tracks_symbols_and_delegates():
     ds.subscribe_bars.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_update_bar_subscriptions_replaces_symbol_set():
+    mgr, _ts, ds, _ = _make_manager()
+    ds._running = False
+    callback = AsyncMock()
+    mgr.subscribe_bars(callback, "AAPL", "QQQ")
+
+    added, removed = await mgr.update_bar_subscriptions(callback, {"QQQ", "MSFT"})
+
+    assert added == {"MSFT"}
+    assert removed == {"AAPL"}
+    assert mgr.subscribed_symbols == {"QQQ", "MSFT"}
+    ds.unsubscribe_bars.assert_called_once_with("AAPL")
+    assert ds.subscribe_bars.call_count == 2
+
+
 # ── 3. Mappers ────────────────────────────────────────────────────────────────
 
 

@@ -280,6 +280,21 @@ def test_evaluate_entry_crosses_below_fires_on_crossing_bar():
     assert result is None or result.symbol == "AAPL"
 
 
+def test_crossover_honors_configured_lookback_window():
+    condition = Condition(
+        left=_ref(IndicatorType.PRICE),
+        op=ComparisonOp.CROSSES_ABOVE,
+        right=5.0,
+        lookback_bars=3,
+    )
+    engine = StrategyEngine(_strategy(_group(condition)))
+    bars = _make_df([1.0, 6.0, 7.0, 8.0])
+
+    signal = engine.evaluate_entry("AAPL", bars)
+
+    assert signal is not None
+
+
 # ── evaluate_exit — individual exits ─────────────────────────────────────────
 
 
@@ -337,6 +352,23 @@ def test_evaluate_exit_trailing_stop_fires():
     signal = engine.evaluate_exit("AAPL", bars, pos)
     assert signal is not None
     assert signal.exit_type == "trailing_stop"
+
+
+def test_trailing_stop_can_use_peak_since_entry_instead_of_warmup_peak():
+    entry = _group(_cond(_ref(IndicatorType.SMA, period=5), ComparisonOp.GT, 0.0))
+    engine = StrategyEngine(_strategy(entry, _exit(stop_loss_pct=20, trailing_stop_pct=10)))
+    prices = [200.0] + [100.0] * 29
+    bars = _make_df(prices, high=[200.0] + [105.0] * 29)
+    position = _position(avg_entry_price=100.0, current_price=100.0)
+
+    signal = engine.evaluate_exit(
+        "AAPL",
+        bars,
+        position,
+        high_since_entry=105.0,
+    )
+
+    assert signal is None
 
 
 def test_evaluate_exit_inverse_signal_fires():

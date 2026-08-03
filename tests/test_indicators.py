@@ -290,9 +290,9 @@ def test_volume_avg_known_values():
 
 
 def test_breakout_known_values():
-    """Reference: rolling max/min over lookback window.
+    """Reference: rolling max/min over the *prior* lookback window.
     high=[1,2,3,4,5], low=[5,4,3,2,1], lookback=3:
-      high_n at t=4: max(3,4,5)=5; low_n at t=4: min(3,2,1)=1.
+      high_n at t=4: max(2,3,4)=4; low_n at t=4: min(4,3,2)=2.
     """
     df = _make_df(
         [3.0, 3.0, 3.0, 3.0, 3.0],
@@ -301,9 +301,23 @@ def test_breakout_known_values():
     )
     result = breakout(df, lookback=3)
     assert set(result.columns) == {"high_n", "low_n"}
-    assert result["high_n"].iloc[-1] == pytest.approx(5.0)
-    assert result["low_n"].iloc[-1] == pytest.approx(1.0)
-    assert result["high_n"].iloc[:2].isna().all()
+    assert result["high_n"].iloc[-1] == pytest.approx(4.0)
+    assert result["low_n"].iloc[-1] == pytest.approx(2.0)
+    assert result["high_n"].iloc[:3].isna().all()
+
+
+def test_breakout_close_can_exceed_prior_high():
+    """Regression: including the current high made close > high_n impossible."""
+    df = _make_df(
+        [9.0, 10.0, 11.0, 13.0],
+        high=[10.0, 11.0, 12.0, 13.5],
+        low=[8.0, 9.0, 10.0, 12.0],
+    )
+
+    result = breakout(df, lookback=3)
+
+    assert result["high_n"].iloc[-1] == pytest.approx(12.0)
+    assert df["close"].iloc[-1] > result["high_n"].iloc[-1]
 
 
 # ── Price ─────────────────────────────────────────────────────────────────────

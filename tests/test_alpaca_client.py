@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from alpaca.data.enums import Adjustment
 
 from src.broker.alpaca_client import AlpacaClient, _classify_422, _map_calendar_day
 from src.broker.exceptions import (
@@ -363,6 +364,26 @@ class TestGetOrder:
 
         assert result is None
 
+    async def test_get_order_by_client_id_supports_crash_reconciliation(self) -> None:
+        tc = MagicMock()
+        tc.get_order_by_client_id.return_value = _raw_order(status="accepted")
+        client = _make_client(tc=tc)
+
+        result = await client.get_order_by_client_id("client-123")
+
+        assert result is not None
+        assert result.status == "accepted"
+        tc.get_order_by_client_id.assert_called_once_with("client-123")
+
+    async def test_get_order_by_client_id_returns_none_when_absent(self) -> None:
+        err = Exception("Not Found")
+        err.status_code = 404
+        tc = MagicMock()
+        tc.get_order_by_client_id.side_effect = err
+        client = _make_client(tc=tc)
+
+        assert await client.get_order_by_client_id("missing") is None
+
 
 # ── get_clock ─────────────────────────────────────────────────────────────────
 
@@ -450,8 +471,6 @@ class TestGetBars:
             )
 
     async def test_returns_bar_data_list(self) -> None:
-        import sys
-
         raw_bar = MagicMock()
         raw_bar.timestamp = datetime(2026, 5, 9, 13, 30, tzinfo=UTC)
         raw_bar.open = 480.0
@@ -462,7 +481,7 @@ class TestGetBars:
         raw_bar.vwap = 480.5
 
         bar_set = MagicMock()
-        bar_set.get.return_value = [raw_bar]
+        bar_set.data = {"QQQ": [raw_bar]}
 
         dc = MagicMock()
         dc.get_stock_bars.return_value = bar_set
@@ -484,7 +503,7 @@ class TestGetBars:
 
     async def test_empty_symbol_returns_empty_list(self) -> None:
         bar_set = MagicMock()
-        bar_set.get.return_value = []
+        bar_set.data = {}
 
         dc = MagicMock()
         dc.get_stock_bars.return_value = bar_set
@@ -498,6 +517,23 @@ class TestGetBars:
         )
 
         assert bars == []
+
+    async def test_passes_explicit_adjustment_to_historical_request(self) -> None:
+        bar_set = MagicMock()
+        bar_set.data = {}
+        dc = MagicMock()
+        dc.get_stock_bars.return_value = bar_set
+        client = _make_client(dc=dc)
+
+        await client.get_bars(
+            "SPY",
+            start=datetime(2020, 1, 1, tzinfo=UTC),
+            end=datetime(2026, 1, 1, tzinfo=UTC),
+            adjustment=Adjustment.ALL,
+        )
+
+        request = dc.get_stock_bars.call_args.args[0]
+        assert request.adjustment == Adjustment.ALL
 
 
 # ── get_market_calendar ───────────────────────────────────────────────────────

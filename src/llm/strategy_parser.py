@@ -57,7 +57,7 @@ SCHEMA:
   "name": "string (short strategy name)",
   "universe": ["TICKER", ...],
   "timeframe": "1Min" | "5Min" | "15Min" | "1H" | "1D",
-  "session": "regular" | "extended" | "24/7",
+  "session": "regular" | "extended",
   "horizon": "intraday" | "swing" | "position",
   "eod_policy": "close_all" | "hold",
   "entry_rules": {

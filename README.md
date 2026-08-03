@@ -11,10 +11,12 @@ An automated trading bot that executes strategies defined in plain language, con
 - **Natural-language strategy** — describe your strategy in plain Spanish or English; Claude (Sonnet) converts it to validated rules once.
 - **Deterministic execution** — RSI, EMA, SMA, MACD, Bollinger Bands, ATR, VWAP, breakout indicators; no LLM in the trading loop.
 - **12-check risk manager** — position sizing, exposure limits, stop-loss, duplicate orders, buying power, clock drift.
-- **Telegram control** — pause, resume, view positions, set risk overrides, ask questions, daily P&L summary.
-- **Market-hours aware** — NYSE/NASDAQ calendar (Alpaca), warmup period, EOD close-all or hold, holiday detection.
+- **Telegram control and diagnostics** — pause, resume, view positions, inspect streams/bars/rules, set risk overrides, ask questions, daily P&L summary.
+- **Market-hours recovery** — recurring NYSE/NASDAQ calendar reconciliation, warmup after restarts, EOD close-all or hold, early closes and holiday detection.
+- **Timeframe-correct live data** — Alpaca minute bars are aggregated into completed 5m, 15m or 1h strategy bars before evaluation.
+- **Recoverable order lifecycle** — order intent is committed before submission and reconciled by client order ID after a restart.
 - **Paper trading by default** — one env-var change + explicit confirmation flag to go live.
-- **Systemd deployment** — runs as a non-root system service with automatic restart.
+- **Persistent deployment** — macOS LaunchDaemon and Linux systemd service definitions with automatic restart.
 
 ---
 
@@ -26,11 +28,12 @@ An automated trading bot that executes strategies defined in plain language, con
 4. [Configure `.env`](#configure-env)
 5. [Run locally](#run-locally)
 6. [Test with a strategy](#test-with-a-strategy)
-7. [Deploy on a VM (systemd)](#deploy-on-a-vm-systemd)
-8. [Switch from paper to live trading](#switch-from-paper-to-live-trading)
-9. [Telegram commands reference](#telegram-commands-reference)
-10. [Architecture overview](#architecture-overview)
-11. [Appendix: Docker (optional)](#appendix-docker-optional)
+7. [Deploy permanently on macOS](#deploy-permanently-on-macos)
+8. [Deploy on a VM (systemd)](#deploy-on-a-vm-systemd)
+9. [Switch from paper to live trading](#switch-from-paper-to-live-trading)
+10. [Telegram commands reference](#telegram-commands-reference)
+11. [Architecture overview](#architecture-overview)
+12. [Appendix: Docker (optional)](#appendix-docker-optional)
 
 ---
 
@@ -135,8 +138,8 @@ The bot will:
 2. Connect to Alpaca (paper).
 3. Load the active strategy from DB (if any).
 4. Start the Telegram bot (polling).
-5. Schedule market-hours jobs.
-6. Wait for the market to open.
+5. Start recurring market/calendar and order reconciliation.
+6. Reconcile immediately: a mid-session start warms history and becomes active without waiting for the next day.
 
 Stop with `Ctrl+C` — it will clean up streams and the scheduler gracefully.
 
@@ -201,6 +204,67 @@ Then: `/confirm` to activate, or `/cancel` to discard.
 
 ### 9. Daily summary
 Automatically sent 5 minutes after market close. You can also trigger it by observing logs.
+
+### 10. Diagnose inactivity
+```
+/diagnostics
+```
+This shows the reconciled market state, stream health, current subscriptions,
+age of the last bar, last rule evaluation, condition snapshot, last signal,
+risk rejection and runtime error. It distinguishes “no signal” from “no data”
+or “market state stuck”.
+
+### 11. Backtest the active daily strategy
+```
+/backtest
+/backtest 90
+```
+The command runs in the background and never accesses Alpaca's order endpoint.
+It downloads enough warmup history, evaluates signals at each daily close and
+simulates fills at the next session open. The Telegram report includes return,
+maximum drawdown, fills, open positions, risk rejections and the pass rate of
+every entry condition. The optional argument is calendar days (30 by default,
+5–730 allowed).
+
+For a reproducible command-line run:
+```bash
+python -m src.backtest_cli \
+  --strategy strategies/etf_pullback_trend_filtered.json \
+  --days 30 --initial-cash 100000 --slippage-bps 5 --send-telegram
+```
+
+The current implementation intentionally supports `1D` strategies only.
+Assumptions are signal-at-close, next-open execution, fractional shares, no
+taxes and configurable slippage (5 bps by default).
+
+---
+
+## Deploy permanently on macOS
+
+The macOS installer uses the existing pyenv Python 3.11.15, copies the app to
+`/opt/alpaca-agent`, migrates the database, activates the exact recommended
+paper strategy and installs a system LaunchDaemon with `RunAtLoad` and
+`KeepAlive` enabled.
+
+From the repository root, run:
+
+```bash
+sudo ./deploy/enable-macos-host.sh
+```
+
+The host setup also disables computer sleep on AC power, enables wake-on-LAN
+and enables restart after a power failure. Verify it with:
+
+```bash
+pmset -g custom
+launchctl print system/com.santiagocano.alpaca-agent
+tail -f /opt/alpaca-agent/logs/trading_bot.log
+```
+
+The deployed `.env` remains mode `600`, and the activation command refuses a
+live Alpaca URL. FileVault remains enabled: after a total power loss, macOS may
+require a person to unlock the encrypted disk before any LaunchDaemon can run.
+Use a UPS if unattended recovery through outages is required.
 
 ---
 
@@ -329,6 +393,8 @@ The automatic backup timer runs every 6 hours via `trading-agent-backup.timer`.
 | `/closeall confirm` | Execute the close (or queue if market closed) |
 | `/ask <question>` | Free-form question answered by Claude (Haiku) with context |
 | `/setlimit <param> <value>` | Override risk limit for current session |
+| `/diagnostics` | Calendar, streams, subscriptions, last bars/evaluations and rejection reason |
+| `/backtest [days]` | Simulate the active daily strategy on historical data; defaults to 30 days |
 | `/help` | List all commands |
 
 **Valid `/setlimit` parameters:**
@@ -344,32 +410,25 @@ The automatic backup timer runs every 6 hours via `trading-agent-backup.timer`.
 ## Architecture overview
 
 ```
-Telegram (user)
-    │
+Telegram → strategy parser → validated Strategy
+    │                         │
+    │ /confirm                └─► hot-update stream subscriptions + warmup
     ▼
-telegram_bot/ ─── BotState + BotDeps ──► scheduler/jobs.py
-    │                                         │
-    │   /strategy <text>                      │ warmup / open / close
-    ▼                                         │ daily_summary / healthcheck
-llm/strategy_parser.py                        ▼
-  (claude-sonnet-4-5, once)           strategy/engine.py
-    │                                   (evaluate_entry / evaluate_exit)
-    ▼                                         │
-strategy/schema.py (Strategy)                 │ entry/exit signal
-    │                                         ▼
-    └──────────────────────────►  broker/risk_manager.py (12 checks)
-                                              │
-                                              ▼
-                               broker/alpaca_client.py (submit_order)
-                                              │
-                                              ▼
-                                    storage/models.py (OrderAttempt)
-                                              │
-                                              ▼
-                                    Telegram (trade notification)
-
-Stream: Alpaca → BarEvent → on_bar_event() → engine → risk_manager → Alpaca
-        Alpaca → TradeUpdateEvent → update OrderAttempt status in DB
+BotState / BotDeps ◄──── recurring market/calendar reconciler
+    │
+Alpaca 1m stream → timeframe aggregator → completed strategy bar
+    │                                      │
+    │                                      ▼
+    └────────────────────────────── deterministic engine
+                                           │
+                                           ▼
+                                  12-check risk manager
+                                           │
+                                           ▼
+                         persist OrderAttempt → submit to Alpaca
+                                           │
+                                           ▼
+                         trade stream / reconciler → Trade + status
 ```
 
 ### Key design decisions
@@ -377,6 +436,8 @@ Stream: Alpaca → BarEvent → on_bar_event() → engine → risk_manager → A
 - **LLM called only twice**: once to parse a new strategy (`claude-sonnet-4-5`), once for the daily summary / `/ask` (`claude-haiku-4-5`). Never in the trading loop.
 - **12-check risk manager**: cheap checks first (paused flag, qty > 0) before expensive ones (account balance, positions).
 - **Deterministic engine**: pure pandas indicator functions; no randomness or LLM.
+- **Idempotent reconciliation**: market transitions, EOD liquidation and summaries are keyed by trading date so polling cannot execute them twice.
+- **Observable inactivity**: `/diagnostics` exposes whether silence comes from closed market, stale streams, missing bars, unmet conditions or risk rejection.
 - **systemd deployment**: non-root service user, `ProtectSystem=strict`, automatic restart on failure.
 
 ---

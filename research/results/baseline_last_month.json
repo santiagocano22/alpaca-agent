@@ -1,0 +1,22 @@
+{
+  "period": "2026-07-01..2026-07-31",
+  "symbol_days_evaluated": 198,
+  "condition_pass_counts": {
+    "price_above_sma200": 183,
+    "ema20_above_ema50": 167,
+    "rsi14_crosses_above_40_one_bar": 5,
+    "price_above_ema20": 114,
+    "complete_entry": 0
+  },
+  "complete_entries_by_symbol": {
+    "SPY": 0,
+    "QQQ": 0,
+    "IWM": 0,
+    "XLK": 0,
+    "XLF": 0,
+    "XLI": 0,
+    "XLV": 0,
+    "XLY": 0,
+    "XLE": 0
+  }
+}

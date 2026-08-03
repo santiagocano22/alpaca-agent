@@ -161,13 +161,17 @@ def volume_avg(df: pd.DataFrame, period: int = 20) -> pd.Series:
 
 
 def breakout(df: pd.DataFrame, lookback: int = 20) -> pd.DataFrame:
-    """Rolling N-bar high and low breakout levels.
+    """Prior N-bar high and low breakout levels.
 
-    Returns a DataFrame with columns: ``high_n``, ``low_n``.
-    First ``lookback-1`` values are NaN.
+    The current bar is deliberately excluded.  Including it makes the usual
+    close-above-high breakout impossible because a bar's close cannot exceed
+    its own high.  Returns a DataFrame with columns ``high_n`` and ``low_n``;
+    the first ``lookback`` values are NaN.
     """
-    high_n = df["high"].rolling(window=lookback, min_periods=lookback).max()
-    low_n = df["low"].rolling(window=lookback, min_periods=lookback).min()
+    high_n = (
+        df["high"].shift(1).rolling(window=lookback, min_periods=lookback).max()
+    )
+    low_n = df["low"].shift(1).rolling(window=lookback, min_periods=lookback).min()
     return pd.DataFrame({"high_n": high_n, "low_n": low_n}, index=df.index)
 
 

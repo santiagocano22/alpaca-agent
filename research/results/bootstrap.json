@@ -1,0 +1,8 @@
+{
+  "samples": 10000,
+  "terminal_return_p05_pct": 8.377716166390245,
+  "terminal_return_median_pct": 30.92680657730018,
+  "terminal_return_p95_pct": 59.97626053780321,
+  "max_drawdown_p50_pct": -5.233313691097169,
+  "max_drawdown_p05_worst_pct": -9.360285706399834
+}

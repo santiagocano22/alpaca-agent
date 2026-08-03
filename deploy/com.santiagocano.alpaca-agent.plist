@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.santiagocano.alpaca-agent</string>
+  <key>UserName</key>
+  <string>santiagocano</string>
+  <key>WorkingDirectory</key>
+  <string>/opt/alpaca-agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/alpaca-agent/.venv/bin/python</string>
+    <string>-m</string>
+    <string>src.main</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/opt/alpaca-agent/logs/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/opt/alpaca-agent/logs/launchd-error.log</string>
+</dict>
+</plist>

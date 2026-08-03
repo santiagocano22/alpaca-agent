@@ -21,9 +21,11 @@ import pytest
 from src.telegram_bot.bot import BotDeps, BotState
 from src.telegram_bot.commands import (
     handle_ask,
+    handle_backtest,
     handle_cancel,
     handle_closeall,
     handle_confirm,
+    handle_diagnostics,
     handle_help,
     handle_pause,
     handle_positions,
@@ -139,6 +141,7 @@ def _make_session_factory(session=None):
         mock_session.add = MagicMock()
         mock_session.commit = AsyncMock()
         mock_session.execute = AsyncMock(return_value=MagicMock())
+        mock_session.get = AsyncMock(return_value=None)
         yield mock_session
     return _factory
 
@@ -395,6 +398,62 @@ async def test_confirm_activates_pending_strategy():
     assert state.active_strategy is pending
     assert state.pending_strategy is None
     assert "New Strat" in _sent_text(context)
+
+
+@pytest.mark.asyncio
+async def test_confirm_updates_stream_subscriptions_and_clears_cache():
+    pending = _make_strategy("Hot Reload")
+    state = BotState(
+        pending_strategy=pending,
+        pending_strategy_raw="buy AAPL",
+        pending_strategy_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    deps = _make_deps()
+    deps.bars_cache["OLD"] = MagicMock()
+    stream = MagicMock()
+    stream.replace_bar_symbols = AsyncMock(return_value=({"AAPL"}, {"OLD"}))
+    stream.subscribed_symbols = {"AAPL"}
+    deps.stream_manager = stream
+    update = _make_update()
+    context = _make_context(state, deps)
+
+    await handle_confirm(update, context)
+
+    stream.replace_bar_symbols.assert_awaited_once_with({"AAPL"})
+    assert deps.bars_cache == {}
+    assert state.subscribed_symbols == {"AAPL"}
+    assert "AAPL" in _sent_text(context)
+
+
+@pytest.mark.asyncio
+async def test_confirm_keeps_current_strategy_when_persistence_fails():
+    current = _make_strategy("Current")
+    pending = _make_strategy("Pending")
+    state = BotState(
+        active_strategy=current,
+        pending_strategy=pending,
+        pending_strategy_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    )
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=RuntimeError("database unavailable"))
+
+    @asynccontextmanager
+    async def failing_session_factory():
+        yield session
+
+    deps = _make_deps(session_factory=failing_session_factory)
+    stream = MagicMock()
+    stream.replace_bar_symbols = AsyncMock()
+    deps.stream_manager = stream
+    update = _make_update()
+    context = _make_context(state, deps)
+
+    await handle_confirm(update, context)
+
+    assert state.active_strategy is current
+    assert state.pending_strategy is pending
+    stream.replace_bar_symbols.assert_not_awaited()
+    assert "no cambió" in _sent_text(context)
 
 
 @pytest.mark.asyncio
@@ -686,3 +745,62 @@ async def test_help_lists_commands():
     text = _sent_text(context)
     for cmd in ["/start", "/status", "/positions", "/strategy", "/pause", "/help"]:
         assert cmd in text
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_exposes_operational_state():
+    state = BotState(
+        market_state="ACTIVE",
+        active_strategy=_make_strategy(),
+        subscribed_symbols={"AAPL"},
+        last_bar_at={"AAPL": datetime.now(UTC)},
+        last_signal="BUY AAPL",
+    )
+    deps = _make_deps()
+    stream = MagicMock()
+    stream.is_data_stream_running = True
+    stream.is_trading_stream_running = True
+    deps.stream_manager = stream
+    update = _make_update()
+    context = _make_context(state, deps)
+
+    await handle_diagnostics(update, context)
+
+    text = _sent_text(context)
+    assert "Diagnóstico" in text
+    assert "AAPL" in text
+    assert "datos=up" in text
+
+
+@pytest.mark.asyncio
+async def test_backtest_runs_in_background_and_sends_report():
+    state = BotState(active_strategy=_make_strategy())
+    deps = _make_deps()
+    update = _make_update()
+    context = _make_context(state, deps, args=["30"])
+
+    with (
+        patch("src.backtest.run_backtest", new=AsyncMock(return_value=MagicMock())),
+        patch("src.backtest.format_backtest_report", return_value="BACKTEST REPORT"),
+    ):
+        await handle_backtest(update, context)
+        task = state.backtest_task
+        assert task is not None
+        await task
+
+    text = _sent_text(context)
+    assert "Simulación iniciada" in text
+    assert "BACKTEST REPORT" in text
+    assert state.backtest_running is False
+
+
+@pytest.mark.asyncio
+async def test_backtest_requires_active_strategy():
+    state = BotState(active_strategy=None)
+    deps = _make_deps()
+    update = _make_update()
+    context = _make_context(state, deps)
+
+    await handle_backtest(update, context)
+
+    assert "No hay estrategia activa" in _sent_text(context)

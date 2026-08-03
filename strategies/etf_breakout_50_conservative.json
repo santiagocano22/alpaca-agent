@@ -1,0 +1,27 @@
+{
+  "name": "etf_breakout_50_conservative",
+  "universe": ["SPY", "QQQ", "IWM", "XLK", "XLF", "XLI", "XLV", "XLY", "XLE"],
+  "timeframe": "1D",
+  "session": "regular",
+  "horizon": "swing",
+  "eod_policy": "hold",
+  "entry_rules": {
+    "logic": "AND",
+    "conditions": [
+      {"left": {"type": "price", "params": {}}, "op": ">", "right": {"type": "sma", "params": {"period": 200}}, "lookback_bars": 1},
+      {"left": {"type": "price", "params": {}}, "op": ">", "right": {"type": "breakout", "params": {"lookback": 50, "column": "high_n"}}, "lookback_bars": 1}
+    ]
+  },
+  "exit_rules": {
+    "take_profit_pct": null,
+    "stop_loss_pct": 7.0,
+    "trailing_stop_pct": 10.0,
+    "inverse_signal": {
+      "logic": "AND",
+      "conditions": [
+        {"left": {"type": "price", "params": {}}, "op": "crosses_below", "right": {"type": "ema", "params": {"period": 20}}, "lookback_bars": 1}
+      ]
+    }
+  },
+  "position_sizing": {"max_position_pct": 15.0, "max_total_exposure_pct": 75.0, "max_concurrent_positions": 5}
+}

@@ -41,7 +41,7 @@ from datetime import UTC, date, datetime
 from typing import TypeVar
 from zoneinfo import ZoneInfo
 
-from alpaca.data.enums import DataFeed
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame as AlpacaTimeFrame
 from alpaca.trading.enums import OrderSide as AlpacaOrderSide
@@ -264,6 +264,16 @@ class AlpacaClient:
             return None
         return self._map_order_status(raw)
 
+    async def get_order_by_client_id(self, client_order_id: str) -> OrderStatusResult | None:
+        """Find an order by the idempotency key used before submission."""
+        try:
+            raw = await self._with_retry(
+                lambda: self._tc.get_order_by_client_id(client_order_id)
+            )
+        except AlpacaSymbolNotFoundError:
+            return None
+        return self._map_order_status(raw)
+
     # ── Market data ───────────────────────────────────────────────────────────
 
     async def get_latest_price(self, symbol: str) -> float:
@@ -294,6 +304,7 @@ class AlpacaClient:
         start: datetime,
         end: datetime,
         timeframe=None,
+        adjustment: Adjustment | None = None,
     ) -> list[BarData]:
         """Return OHLCV bars for ``symbol`` in [start, end].
 
@@ -301,6 +312,8 @@ class AlpacaClient:
         alpaca-py handles multi-page responses internally; this method
         always returns the complete list across all pages.
         ``timeframe`` defaults to TimeFrame.Minute when not supplied.
+        ``adjustment`` defaults to Alpaca's raw bars; research/backtests may
+        explicitly request ``Adjustment.ALL`` without changing live warmup.
 
         Raises:
             ValueError: if ``start`` or ``end`` is a naive datetime.
@@ -319,13 +332,17 @@ class AlpacaClient:
             timeframe=tf,
             limit=10000,
             feed=DataFeed.IEX,
+            adjustment=adjustment,
         )
 
         bar_set = await self._with_retry(
             lambda: self._dc.get_stock_bars(req),
             symbol=symbol,
         )
-        bars = bar_set.get(symbol, [])
+        # alpaca-py returns a BarSet model whose symbol mapping lives in
+        # ``.data``. Accept a plain mapping as well for backwards compatibility.
+        bar_mapping = getattr(bar_set, "data", bar_set)
+        bars = bar_mapping.get(symbol, [])
         return [self._map_bar(b, symbol) for b in bars]
 
     # ── Clock ─────────────────────────────────────────────────────────────────

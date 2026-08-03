@@ -13,16 +13,31 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pandas as pd
 import pytest
 
-from src.broker.schemas import BarData, BarEvent, OrderSide, PositionSnapshot
+from src.broker.schemas import (
+    BarData,
+    BarEvent,
+    OrderIntent,
+    OrderSide,
+    OrderStatusResult,
+    OrderType,
+    PositionSnapshot,
+    ValidationResult,
+    make_client_order_id,
+)
 from src.scheduler.jobs import (
+    _load_warmup_bars,
+    _submit_persisted_order,
     close_job,
     daily_summary_job,
     healthcheck_job,
     holiday_job,
     on_bar_event,
     open_job,
+    reconcile_market_state_job,
+    reconcile_order_attempts_job,
     warmup_job,
 )
+from src.storage.models import OrderAttempt, Trade
 from src.strategy.engine import StrategyEngine
 from src.strategy.schema import (
     ComparisonOp,
@@ -39,6 +54,7 @@ from src.strategy.schema import (
     Timeframe,
 )
 from src.telegram_bot.bot import BotDeps, BotState
+from sqlalchemy import select
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -49,11 +65,12 @@ def _make_strategy(
     *,
     eod_policy: EodPolicy = EodPolicy.CLOSE_ALL,
     universe: list[str] | None = None,
+    timeframe: Timeframe = Timeframe.M15,
 ) -> Strategy:
     return Strategy(
         name="Test",
         universe=universe or ["AAPL"],
-        timeframe=Timeframe.M15,
+        timeframe=timeframe,
         session=StrategySession.REGULAR,
         horizon=Horizon.INTRADAY,
         eod_policy=eod_policy,
@@ -162,6 +179,44 @@ def _bar_event(
 
 
 # ── warmup_job ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_warmup_filters_extended_hours_for_regular_strategy():
+    alpaca = _make_alpaca()
+    alpaca.get_bars = AsyncMock(
+        return_value=[
+            BarData(
+                symbol="AAPL",
+                timestamp=datetime(2025, 1, 8, 14, 0, tzinfo=UTC),  # 09:00 ET
+                open=100,
+                high=101,
+                low=99,
+                close=100,
+                volume=100,
+            ),
+            BarData(
+                symbol="AAPL",
+                timestamp=datetime(2025, 1, 8, 14, 30, tzinfo=UTC),  # 09:30 ET
+                open=101,
+                high=102,
+                low=100,
+                close=101,
+                volume=100,
+            ),
+        ]
+    )
+
+    bars = await _load_warmup_bars(
+        alpaca,
+        "AAPL",
+        "15Min",
+        2,
+        StrategySession.REGULAR,
+    )
+
+    assert len(bars) == 1
+    assert bars.index[0] == datetime(2025, 1, 8, 14, 30, tzinfo=UTC)
 
 
 @pytest.mark.asyncio
@@ -446,9 +501,9 @@ async def test_on_bar_event_no_strategy_skips():
 
 
 @pytest.mark.asyncio
-async def test_on_bar_event_entry_fires_when_rsi_low():
+async def test_on_bar_event_entry_fires_when_rsi_low(mocker):
     """When RSI < 30 condition is met (40 strictly decreasing bars → RSI ≈ 0), entry fires."""
-    strategy = _make_strategy()
+    strategy = _make_strategy(timeframe=Timeframe.M1)
     engine = StrategyEngine(strategy)
 
     # Build a bars_cache with sufficient bars for RSI to be below 30
@@ -469,6 +524,13 @@ async def test_on_bar_event_entry_fires_when_rsi_low():
     bars_cache = {"AAPL": bars_df}
 
     alpaca = _make_alpaca(positions=[])  # no existing positions
+    alpaca.submit_order = AsyncMock(
+        return_value=MagicMock(alpaca_order_id="order-1", status="submitted")
+    )
+    mocker.patch(
+        "src.scheduler.jobs.validate_order",
+        new=AsyncMock(return_value=ValidationResult.approve("AAPL", 1000.0)),
+    )
     state = BotState(market_state="ACTIVE", bot_paused=False, active_strategy=strategy)
     deps = _make_deps(alpaca=alpaca, bars_cache=bars_cache)
     messages = []
@@ -485,9 +547,8 @@ async def test_on_bar_event_entry_fires_when_rsi_low():
         engine=engine,
     )
 
-    # Either an entry fired (message with BUY) or risk manager blocked it
-    # — but no exception must be raised
-    alpaca.submit_order.call_count >= 0  # just assert no crash
+    alpaca.submit_order.assert_awaited_once()
+    assert any("BUY AAPL" in message for message in messages)
 
 
 @pytest.mark.asyncio
@@ -523,3 +584,196 @@ async def test_on_bar_event_no_signal_no_order():
     )
 
     alpaca.submit_order.assert_not_called()
+
+
+# ── Recurring market-state reconciliation ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_reconcile_mid_session_recovers_to_active(sample_calendar):
+    alpaca = _make_alpaca()
+    alpaca.get_bars = AsyncMock(return_value=[])
+    state = BotState(
+        market_state="IDLE",
+        active_strategy=_make_strategy(eod_policy=EodPolicy.HOLD),
+    )
+    deps = _make_deps(alpaca=alpaca)
+    deps.calendar = sample_calendar
+    messages = []
+
+    async def notify(message):
+        messages.append(message)
+
+    await reconcile_market_state_job(
+        state,
+        deps,
+        notify,
+        now=datetime(2025, 1, 8, 15, 0, tzinfo=UTC),  # 10:00 ET
+    )
+
+    assert state.market_state == "ACTIVE"
+    assert any("Mercado abierto" in message for message in messages)
+    assert not any("abre en" in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_operates_across_multiple_sessions(sample_calendar):
+    alpaca = _make_alpaca()
+    alpaca.get_bars = AsyncMock(return_value=[])
+    state = BotState(
+        market_state="IDLE",
+        active_strategy=_make_strategy(eod_policy=EodPolicy.HOLD),
+    )
+    deps = _make_deps(alpaca=alpaca)
+    deps.calendar = sample_calendar
+    messages = []
+
+    async def notify(message):
+        messages.append(message)
+
+    moments = [
+        datetime(2025, 1, 8, 14, 25, tzinfo=UTC),  # warmup
+        datetime(2025, 1, 8, 14, 30, tzinfo=UTC),  # day 1 open
+        datetime(2025, 1, 8, 21, 0, tzinfo=UTC),   # day 1 close
+        datetime(2025, 1, 9, 14, 30, tzinfo=UTC),  # day 2 open
+    ]
+    for moment in moments:
+        await reconcile_market_state_job(state, deps, notify, now=moment)
+
+    assert state.market_state == "ACTIVE"
+    assert sum("Mercado abierto" in message for message in messages) == 2
+    assert sum("Mercado cerrado" in message for message in messages) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_eod_liquidation_is_idempotent(sample_calendar):
+    position = _make_position("AAPL")
+    alpaca = _make_alpaca(positions=[position])
+    alpaca.get_bars = AsyncMock(return_value=[])
+    state = BotState(
+        market_state="ACTIVE",
+        active_strategy=_make_strategy(eod_policy=EodPolicy.CLOSE_ALL),
+    )
+    deps = _make_deps(alpaca=alpaca)
+    deps.calendar = sample_calendar
+    now = datetime(2025, 1, 8, 20, 56, tzinfo=UTC)  # 15:56 ET
+
+    await reconcile_market_state_job(state, deps, _no_notify, now=now)
+    await reconcile_market_state_job(state, deps, _no_notify, now=now)
+
+    alpaca.close_position.assert_called_once_with("AAPL")
+    assert state.last_eod_liquidation_date == date(2025, 1, 8)
+
+
+@pytest.mark.asyncio
+async def test_on_bar_event_waits_for_configured_timeframe(mocker):
+    strategy = _make_strategy(timeframe=Timeframe.M5)
+    state = BotState(market_state="ACTIVE", active_strategy=strategy)
+    deps = _make_deps()
+    engine = StrategyEngine(strategy)
+    evaluate = mocker.patch("src.scheduler.jobs._evaluate_symbol", new_callable=AsyncMock)
+
+    start = datetime(2025, 1, 8, 14, 30, tzinfo=UTC)
+    for minute in range(4):
+        await on_bar_event(
+            _bar_event(timestamp=start + timedelta(minutes=minute)),
+            state,
+            deps,
+            _no_notify,
+            engine,
+        )
+    evaluate.assert_not_awaited()
+
+    await on_bar_event(
+        _bar_event(timestamp=start + timedelta(minutes=4)),
+        state,
+        deps,
+        _no_notify,
+        engine,
+    )
+    evaluate.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_order_attempt_is_committed_with_submission_result(async_session):
+    alpaca = _make_alpaca()
+    alpaca.submit_order = AsyncMock(
+        return_value=MagicMock(alpaca_order_id="alpaca-123", status="accepted")
+    )
+    deps = _make_deps(alpaca=alpaca)
+    state = BotState()
+    intent = OrderIntent(
+        symbol="AAPL",
+        side=OrderSide.BUY,
+        qty=1,
+        order_type=OrderType.MARKET,
+        client_order_id=make_client_order_id(1, "AAPL"),
+    )
+
+    await _submit_persisted_order(
+        intent=intent,
+        db_session=async_session,
+        deps=deps,
+        state=state,
+        notify=_no_notify,
+    )
+
+    attempt = (
+        await async_session.execute(
+            select(OrderAttempt).where(OrderAttempt.client_order_id == intent.client_order_id)
+        )
+    ).scalar_one()
+    assert attempt.alpaca_order_id == "alpaca-123"
+    assert attempt.status == "accepted"
+
+
+@pytest.mark.asyncio
+async def test_order_reconciler_recovers_attempt_by_client_id(async_session):
+    attempt = OrderAttempt(
+        client_order_id="client-recover-1",
+        symbol="AAPL",
+        side="buy",
+        qty=1,
+        order_type="market",
+        status="pending",
+    )
+    async_session.add(attempt)
+    await async_session.commit()
+
+    alpaca = _make_alpaca()
+    alpaca.get_order_by_client_id = AsyncMock(
+        return_value=OrderStatusResult(
+            alpaca_order_id="alpaca-recovered",
+            client_order_id="client-recover-1",
+            status="filled",
+            submitted_at=datetime.now(UTC),
+            filled_at=datetime.now(UTC),
+            filled_qty=1,
+            filled_avg_price=150,
+            side=OrderSide.BUY,
+            symbol="AAPL",
+            qty=1,
+        )
+    )
+    deps = _make_deps(
+        alpaca=alpaca,
+    )
+
+    @asynccontextmanager
+    async def session_factory():
+        yield async_session
+
+    deps.session_factory = session_factory
+
+    await reconcile_order_attempts_job(BotState(), deps, _no_notify)
+
+    await async_session.refresh(attempt)
+    assert attempt.alpaca_order_id == "alpaca-recovered"
+    assert attempt.status == "filled"
+    trade = (
+        await async_session.execute(
+            select(Trade).where(Trade.client_order_id == attempt.client_order_id)
+        )
+    ).scalar_one()
+    assert trade.filled_price == 150
+    assert trade.qty == 1

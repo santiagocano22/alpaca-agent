@@ -156,6 +156,26 @@ class RiskOverride(Base):
     )
 
 
+class RuntimeState(Base):
+    """Crash-safe operational state that must survive process restarts.
+
+    A single row (id=1) stores the global pause latch and trailing-stop peaks.
+    Keeping these values in SQLite prevents launchd from silently resuming a
+    paused bot or loosening a trailing stop after an automatic restart.
+    """
+
+    __tablename__ = "runtime_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    bot_paused: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    position_highs: Mapped[dict[str, float]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 # ── Logging / queuing ─────────────────────────────────────────────────────────
 
 

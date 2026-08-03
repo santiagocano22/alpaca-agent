@@ -11,12 +11,12 @@ Startup sequence:
   8. Build BotState + BotDeps
   9. Build TelegramApplication  (registers handlers; does not connect yet)
   10. Fetch market calendar for today +30 days
-  11. Build APScheduler with today's session jobs
-  12. Register stream callbacks (bar events → on_bar_event, trade updates → log)
+  11. Build APScheduler with recurring market/calendar/order reconciliation
+  12. Register stream callbacks (minute bars → aggregation/evaluation, trades → DB)
   13. Start everything concurrently:
-       - TelegramApplication.run_polling()
+       - TelegramApplication polling
        - AlpacaStreamManager (trading + data streams)
-       - APScheduler
+       - APScheduler recurring jobs
 """
 from __future__ import annotations
 
@@ -105,10 +105,13 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
     from sqlalchemy import select
 
     from src.storage.models import StrategyVersion
+    from src.storage.runtime_state import load_runtime_state
     from src.strategy.schema import Strategy
     from src.telegram_bot.bot import BotDeps, BotState
 
     active_strategy: Strategy | None = None
+    bot_paused = False
+    position_highs: dict[str, float] = {}
     async with session_factory() as db:
         row = (
             await db.execute(
@@ -122,7 +125,23 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
             except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to load strategy from DB: {}; starting without strategy", exc)
 
-    state = BotState(active_strategy=active_strategy)
+        runtime = await load_runtime_state(db)
+        bot_paused = bool(runtime.bot_paused)
+        position_highs = {
+            symbol.upper(): float(high)
+            for symbol, high in (runtime.position_highs or {}).items()
+        }
+        logger.info(
+            "Loaded runtime state: paused={}, trailing_peaks={}",
+            bot_paused,
+            len(position_highs),
+        )
+
+    state = BotState(
+        active_strategy=active_strategy,
+        bot_paused=bot_paused,
+        position_highs=position_highs,
+    )
     deps = BotDeps(
         alpaca=alpaca,
         session_factory=session_factory,
@@ -170,6 +189,7 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
             for day in raw_days
         }
         logger.info("Calendar loaded: {} trading days", len(calendar))
+        state.last_calendar_refresh = datetime.now(UTC)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Failed to fetch calendar: {}; scheduler will not fire session jobs", exc)
 
@@ -182,6 +202,7 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
         notify=notify,
         calendar=calendar,
         warmup_minutes=settings.warmup_minutes_before_open,
+        eod_close_minutes_before=settings.eod_close_minutes_before,
         healthcheck_interval_minutes=settings.healthcheck_interval_minutes,
     )
     scheduler.start()
@@ -217,21 +238,48 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
             event.event,
             event.order.status,
         )
-        if event.event == "fill":
-            async with session_factory() as db:
-                from sqlalchemy import update as sa_update
+        async with session_factory() as db:
+            from src.storage.models import OrderAttempt as OA
+            from src.storage.models import Trade
 
-                from src.storage.models import OrderAttempt as OA
-
+            attempt = (
                 await db.execute(
-                    sa_update(OA)
-                    .where(OA.client_order_id == event.order.client_order_id)
-                    .values(
-                        alpaca_order_id=event.order.alpaca_order_id,
-                        status="filled",
-                    )
+                    select(OA).where(OA.client_order_id == event.order.client_order_id)
                 )
-                await db.commit()
+            ).scalars().first()
+            if attempt is not None:
+                attempt.alpaca_order_id = event.order.alpaca_order_id
+                attempt.status = event.order.status
+                attempt.updated_at = event.timestamp
+
+            if event.event == "fill":
+                existing_trade = (
+                    await db.execute(
+                        select(Trade).where(
+                            Trade.client_order_id == event.order.client_order_id
+                        )
+                    )
+                ).scalars().first()
+                if existing_trade is None:
+                    db.add(
+                        Trade(
+                            client_order_id=event.order.client_order_id,
+                            order_attempt_id=attempt.id if attempt is not None else None,
+                            symbol=event.order.symbol,
+                            side=event.order.side.value,
+                            qty=event.order.filled_qty or event.order.qty,
+                            filled_price=event.order.filled_avg_price,
+                            order_type=attempt.order_type if attempt is not None else "market",
+                            status="filled",
+                            rule_trigger=attempt.rule_trigger if attempt is not None else None,
+                            strategy_version_id=(
+                                attempt.strategy_version_id if attempt is not None else None
+                            ),
+                            filled_at=event.order.filled_at or event.timestamp,
+                        )
+                    )
+                    state.daily_trade_count += 1
+            await db.commit()
 
     # Build stream manager with the SDK stream objects
     universe = list(state.active_strategy.universe) if state.active_strategy else []
@@ -240,18 +288,23 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
         secret_key=settings.alpaca_api_secret,
         paper=is_paper,
     )
+    from alpaca.data.enums import DataFeed
+
     data_stream = StockDataStream(
         api_key=settings.alpaca_api_key,
         secret_key=settings.alpaca_api_secret,
+        feed=DataFeed.IEX,
     )
     stream_mgr = AlpacaStreamManager(
         trading_stream=trading_stream,
         data_stream=data_stream,
         settings=settings,
     )
+    deps.stream_manager = stream_mgr
+    deps.calendar = calendar
     stream_mgr.subscribe_trade_updates(trade_callback)
-    if universe:
-        stream_mgr.subscribe_bars(bar_callback, *universe)
+    await stream_mgr.update_bar_subscriptions(bar_callback, set(universe))
+    state.subscribed_symbols = stream_mgr.subscribed_symbols
 
     # ── Run ───────────────────────────────────────────────────────────────────
     logger.info("Starting Telegram polling and streams…")
@@ -261,6 +314,19 @@ async def _main() -> None:  # noqa: PLR0912, PLR0915
             await tg_app.start()
             await tg_app.updater.start_polling(drop_pending_updates=True)
             await stream_mgr.start()
+            from src.scheduler.jobs import (
+                reconcile_market_state_job,
+                reconcile_order_attempts_job,
+            )
+
+            await reconcile_order_attempts_job(state, deps, notify)
+            await reconcile_market_state_job(
+                state,
+                deps,
+                notify,
+                warmup_minutes=settings.warmup_minutes_before_open,
+                eod_close_minutes_before=settings.eod_close_minutes_before,
+            )
             logger.info("All services running. Press Ctrl+C to stop.")
             # Park here; Ctrl+C raises KeyboardInterrupt / CancelledError
             await asyncio.Event().wait()

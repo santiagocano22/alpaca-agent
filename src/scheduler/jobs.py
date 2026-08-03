@@ -28,6 +28,7 @@ from typing import Any
 
 import pandas as pd
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.broker.risk_manager import validate_order
@@ -39,11 +40,20 @@ from src.broker.schemas import (
     RiskOverrides,
     make_client_order_id,
 )
-from src.storage.models import AlertLog, OrderAttempt
+from src.storage.models import AlertLog, OrderAttempt, PendingAction, RiskOverride, Trade
 from src.strategy.engine import StrategyEngine
-from src.strategy.schema import EodPolicy
+from src.strategy.schema import EodPolicy, Session as StrategySession
 from src.telegram_bot.bot import BotDeps, BotState
-from src.utils.market_hours import CalendarCache
+from src.utils.market_hours import (
+    ET,
+    CalendarCache,
+    MarketDay,
+    MarketState,
+    get_market_state,
+    is_extended_hours_open,
+    minutes_to_close,
+    today_is_holiday,
+)
 
 # ── Type aliases ──────────────────────────────────────────────────────────────
 
@@ -55,12 +65,22 @@ NotifyFn = Callable[[str], Awaitable[None]]
 _WARMUP_BARS_SAFETY_MULTIPLIER = 1.5
 """Fetch 50% more bars than required to account for weekends/holidays in lookback."""
 
+_NON_TERMINAL_ORDER_STATUSES = {
+    "pending",
+    "submitted",
+    "accepted",
+    "new",
+    "pending_new",
+    "partially_filled",
+}
+
 
 async def _load_warmup_bars(
     alpaca,
     symbol: str,
     timeframe_str: str,
     required_bars: int,
+    session: StrategySession = StrategySession.REGULAR,
 ) -> pd.DataFrame:
     """Fetch historical bars for indicator warmup.
 
@@ -107,6 +127,14 @@ async def _load_warmup_bars(
             ],
             index=pd.DatetimeIndex([b.timestamp for b in bar_list]),
         )
+        if timeframe_str != "1D" and session != StrategySession.CRYPTO_24_7:
+            index_et = df.index.tz_convert(ET)
+            minute_of_day = index_et.hour * 60 + index_et.minute
+            if session == StrategySession.EXTENDED:
+                session_start, session_end = 4 * 60, 20 * 60
+            else:
+                session_start, session_end = 9 * 60 + 30, 16 * 60
+            df = df[(minute_of_day >= session_start) & (minute_of_day < session_end)]
         logger.info("Warmup: fetched {} bars for {} (needed {})", len(df), symbol, required_bars)
         return df
     except Exception as exc:  # noqa: BLE001
@@ -117,12 +145,37 @@ async def _load_warmup_bars(
 # ── Market state job functions ─────────────────────────────────────────────────
 
 
+async def preload_strategy_bars(state: BotState, deps: BotDeps) -> tuple[int, int]:
+    """Load timeframe-consistent history for the currently active strategy."""
+    if state.active_strategy is None:
+        return 0, 0
+    engine = StrategyEngine(state.active_strategy)
+    needed = engine.required_lookback_bars()
+    timeframe = state.active_strategy.timeframe.value
+    symbols = state.active_strategy.universe
+    deps.bar_aggregator.reset(set(symbols))
+    loaded = 0
+    for symbol in symbols:
+        frame = await _load_warmup_bars(
+            deps.alpaca,
+            symbol,
+            timeframe,
+            needed,
+            state.active_strategy.session,
+        )
+        if not frame.empty:
+            deps.bars_cache[symbol] = frame
+            loaded += 1
+    return loaded, len(symbols)
+
+
 async def warmup_job(
     state: BotState,
     deps: BotDeps,
     notify: NotifyFn,
     *,
     warmup_minutes: int = 5,
+    notify_user: bool = True,
 ) -> None:
     """Transition IDLE → WARMUP and preload indicator bars.
 
@@ -142,51 +195,116 @@ async def warmup_job(
 
     state.market_state = "WARMUP"
     strategy_name = state.active_strategy.name if state.active_strategy else "ninguna"
-    msg = f"⏰ Mercado abre en {warmup_minutes} min. Preparando estrategia: {strategy_name}."
-    await notify(msg)
+    if notify_user:
+        msg = f"⏰ Mercado abre en {warmup_minutes} min. Preparando estrategia: {strategy_name}."
+        await notify(msg)
 
     if state.active_strategy is None:
         logger.info("Warmup: no active strategy, skipping bar preload")
         return
 
-    # Preload bars for all universe symbols.
-    engine = StrategyEngine(state.active_strategy)
-    needed = engine.required_lookback_bars()
-    tf = state.active_strategy.timeframe.value
+    loaded, total = await preload_strategy_bars(state, deps)
+    if loaded < total:
+        state.last_error = f"Warmup incompleto: {loaded}/{total} símbolos con histórico"
 
-    for symbol in state.active_strategy.universe:
-        df = await _load_warmup_bars(deps.alpaca, symbol, tf, needed)
-        if not df.empty:
-            deps.bars_cache[symbol] = df
+
+async def refresh_calendar_job(
+    state: BotState,
+    deps: BotDeps,
+    notify: NotifyFn,
+    *,
+    now: datetime | None = None,
+    lookahead_days: int = 45,
+) -> bool:
+    """Refresh the shared Alpaca calendar in place, with retryable failure state."""
+    reference = now or datetime.now(UTC)
+    try:
+        raw_days = await deps.alpaca.get_market_calendar(
+            start=reference.date(),
+            end=(reference + timedelta(days=lookahead_days)).date(),
+        )
+        refreshed = {
+            day.date: MarketDay(date=day.date, open=day.open_et, close=day.close_et)
+            for day in raw_days
+        }
+        deps.calendar.clear()
+        deps.calendar.update(refreshed)
+        state.last_calendar_refresh = reference
+        logger.info("Calendar refreshed: {} trading days", len(refreshed))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        state.last_error = f"Calendar refresh failed: {exc}"
+        logger.error("Calendar refresh failed: {}", exc)
+        await notify(f"⚠️ ALERTA: no se pudo actualizar el calendario de mercado: {exc}")
+        return False
 
 
 async def open_job(
     state: BotState,
     notify: NotifyFn,
+    deps: BotDeps | None = None,
 ) -> None:
     """Transition WARMUP → ACTIVE at session open."""
     state.market_state = "ACTIVE"
     logger.info("Market opened — transitioning to ACTIVE")
     await notify("🟢 Mercado abierto. Bot operativo.")
+    if deps is None:
+        return
+
+    async with deps.session_factory() as db:
+        pending = (
+            await db.execute(
+                select(PendingAction).where(
+                    PendingAction.status == "pending",
+                    PendingAction.type == "close_all",
+                )
+            )
+        ).scalars().all()
+        if not pending:
+            return
+        try:
+            positions = await deps.alpaca.get_positions()
+            for position in positions:
+                await deps.alpaca.close_position(position.symbol)
+            for action in pending:
+                action.status = "executed"
+                action.executed_at = datetime.now(UTC)
+            await db.commit()
+            await notify(
+                f"✅ Acción pendiente close_all ejecutada para {len(positions)} posición(es)."
+            )
+        except Exception as exc:  # noqa: BLE001
+            await db.rollback()
+            state.last_error = f"Pending close_all failed: {exc}"
+            await notify(f"⚠️ Falló la acción pendiente close_all: {exc}")
 
 
 async def close_job(
     state: BotState,
     deps: BotDeps,
     notify: NotifyFn,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Transition ACTIVE → IDLE at session close.
 
     If the active strategy has ``eod_policy=close_all``, all open positions
     are closed with market orders before transitioning.
     """
-    if state.active_strategy and state.active_strategy.eod_policy == EodPolicy.CLOSE_ALL:
+    reference = now or datetime.now(UTC)
+    current_trade_date = reference.astimezone(ET).date()
+    if (
+        state.active_strategy
+        and state.active_strategy.eod_policy == EodPolicy.CLOSE_ALL
+        and state.last_eod_liquidation_date != current_trade_date
+    ):
         logger.info("EOD policy=close_all: closing all positions")
         try:
             positions = await deps.alpaca.get_positions()
             for pos in positions:
                 await deps.alpaca.close_position(pos.symbol)
                 logger.info("EOD: closed position {}", pos.symbol)
+            state.last_eod_liquidation_date = current_trade_date
         except Exception as exc:  # noqa: BLE001
             logger.error("EOD close_all error: {}", exc)
 
@@ -196,15 +314,10 @@ async def close_job(
         and state.active_strategy.timeframe.value == "1D"
         and not state.bot_paused
     ):
-        from datetime import UTC, datetime, timedelta
-
         from alpaca.data.timeframe import TimeFrame
 
-        from src.broker.schemas import RiskOverrides
-
         engine = StrategyEngine(state.active_strategy)
-        overrides = RiskOverrides()
-        today_end = datetime.now(UTC)
+        today_end = reference
         today_start = today_end - timedelta(hours=24)
 
         for symbol in state.active_strategy.universe:
@@ -239,7 +352,7 @@ async def close_job(
                     deps=deps,
                     notify=notify,
                     engine=engine,
-                    overrides=overrides,
+                    overrides=None,
                     calendar=None,
                 )
             except Exception as exc:  # noqa: BLE001
@@ -248,6 +361,162 @@ async def close_job(
     state.market_state = "IDLE"
     logger.info("Market closed — transitioning to IDLE")
     await notify("🔴 Mercado cerrado. Generando resumen del día…")
+
+
+async def eod_liquidation_job(
+    state: BotState,
+    deps: BotDeps,
+    notify: NotifyFn,
+    *,
+    trade_date: date,
+) -> None:
+    """Apply close-all policy once, before the official market close."""
+    if state.last_eod_liquidation_date == trade_date:
+        return
+    if state.active_strategy is None or state.active_strategy.eod_policy != EodPolicy.CLOSE_ALL:
+        state.last_eod_liquidation_date = trade_date
+        return
+    try:
+        positions = await deps.alpaca.get_positions()
+        for position in positions:
+            await deps.alpaca.close_position(position.symbol)
+        state.last_eod_liquidation_date = trade_date
+        if positions:
+            await notify(
+                f"🧹 Cierre EOD enviado para {len(positions)} posición(es) antes del cierre."
+            )
+    except Exception as exc:  # noqa: BLE001
+        state.last_error = f"EOD liquidation failed: {exc}"
+        logger.error("EOD liquidation failed: {}", exc)
+        await notify(f"⚠️ ALERTA: falló el cierre EOD de posiciones: {exc}")
+
+
+async def reconcile_market_state_job(
+    state: BotState,
+    deps: BotDeps,
+    notify: NotifyFn,
+    *,
+    now: datetime | None = None,
+    warmup_minutes: int = 5,
+    eod_close_minutes_before: int = 5,
+    summary_delay_minutes: int = 5,
+) -> None:
+    """Idempotently reconcile runtime state with the current Alpaca session.
+
+    Unlike one-shot date jobs, this runs throughout the process lifetime and
+    recovers correctly after restarts, missed jobs, calendar refreshes, and
+    multi-day operation.
+    """
+    reference = now or datetime.now(UTC)
+    if not deps.calendar:
+        await refresh_calendar_job(state, deps, notify, now=reference)
+        if not deps.calendar:
+            return
+
+    reference_et = reference.astimezone(ET)
+    trade_date = reference_et.date()
+    strategy_session = (
+        state.active_strategy.session
+        if state.active_strategy is not None
+        else StrategySession.REGULAR
+    )
+    if strategy_session == StrategySession.EXTENDED:
+        if is_extended_hours_open(reference, deps.calendar):
+            desired = MarketState.ACTIVE
+        else:
+            desired = MarketState.IDLE
+            for offset in range(45):
+                candidate_date = trade_date + timedelta(days=offset)
+                candidate = deps.calendar.get(candidate_date)
+                if candidate is None:
+                    continue
+                session_open = datetime.combine(
+                    candidate_date, candidate.session_open, tzinfo=ET
+                )
+                delta = (session_open - reference_et).total_seconds() / 60
+                if 0 < delta <= warmup_minutes:
+                    desired = MarketState.WARMUP
+                if delta > 0:
+                    break
+    else:
+        desired = get_market_state(reference, deps.calendar, warmup_minutes)
+
+    if (
+        desired == MarketState.IDLE
+        and today_is_holiday(reference, deps.calendar)
+        and state.last_holiday_notice_date != trade_date
+        and state.last_calendar_refresh is not None
+    ):
+        await holiday_job(notify, trade_date=trade_date)
+        state.last_holiday_notice_date = trade_date
+
+    if desired == MarketState.WARMUP:
+        if state.market_state == "IDLE":
+            await warmup_job(
+                state,
+                deps,
+                notify,
+                warmup_minutes=warmup_minutes,
+            )
+        return
+
+    if desired == MarketState.ACTIVE:
+        if state.market_state == "IDLE":
+            # Mid-session restart: preload history without claiming the market
+            # is about to open, then transition immediately to ACTIVE.
+            await warmup_job(
+                state,
+                deps,
+                notify,
+                warmup_minutes=warmup_minutes,
+                notify_user=False,
+            )
+        if state.market_state != "ACTIVE":
+            await open_job(state, notify, deps)
+
+        if strategy_session == StrategySession.EXTENDED:
+            market_day = deps.calendar.get(trade_date)
+            session_close = (
+                datetime.combine(trade_date, market_day.session_close, tzinfo=ET)
+                if market_day is not None
+                else None
+            )
+            remaining = (
+                (session_close - reference_et).total_seconds() / 60
+                if session_close is not None
+                else None
+            )
+        else:
+            remaining = minutes_to_close(reference, deps.calendar)
+        if (
+            remaining is not None
+            and remaining <= eod_close_minutes_before
+            and state.last_eod_liquidation_date != trade_date
+        ):
+            await eod_liquidation_job(
+                state,
+                deps,
+                notify,
+                trade_date=trade_date,
+            )
+        return
+
+    # Desired IDLE. Only emit a close transition if this process observed an
+    # active/warmup state; a nighttime restart must not invent a close event.
+    if state.market_state in {"ACTIVE", "WARMUP"}:
+        await close_job(state, deps, notify, now=reference)
+
+    market_day = deps.calendar.get(trade_date)
+    if market_day is not None and state.last_summary_date != trade_date:
+        close_time = (
+            market_day.session_close
+            if strategy_session == StrategySession.EXTENDED
+            else market_day.close
+        )
+        close_at = datetime.combine(trade_date, close_time, tzinfo=ET)
+        if reference_et >= close_at + timedelta(minutes=summary_delay_minutes):
+            await daily_summary_job(state, deps, notify, now=reference)
+            state.last_summary_date = trade_date
 
 
 async def holiday_job(
@@ -266,6 +535,8 @@ async def daily_summary_job(
     state: BotState,
     deps: BotDeps,
     notify: NotifyFn,
+    *,
+    now: datetime | None = None,
 ) -> None:
     """Generate and send the daily P&L summary via Haiku (runs 5 min after close).
 
@@ -292,13 +563,39 @@ async def daily_summary_job(
         equity = 0.0
         pos_dicts = []
 
+    today = (now or datetime.now(UTC)).astimezone(ET).date()
+    day_start = datetime.combine(today, datetime.min.time(), tzinfo=ET).astimezone(UTC)
+    day_end = day_start + timedelta(days=1)
+    try:
+        async with deps.session_factory() as db:
+            trade_rows = (
+                await db.execute(
+                    select(Trade)
+                    .where(Trade.filled_at >= day_start, Trade.filled_at < day_end)
+                    .order_by(Trade.filled_at)
+                )
+            ).scalars().all()
+        trades_today = [
+            {
+                "symbol": trade.symbol,
+                "side": trade.side,
+                "qty": trade.qty,
+                "filled_price": trade.filled_price,
+                "pnl": trade.pnl,
+            }
+            for trade in trade_rows
+        ]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("daily_summary: failed to load fills: {}", exc)
+        trades_today = []
+
     summary = await generate_daily_summary(
-        trades_today=[],      # Detailed trades not tracked here; tally via state
+        trades_today=trades_today,
         open_positions=pos_dicts,
         realized_pnl=state.daily_realized_pnl,
         unrealized_pnl=sum(p.get("unrealized_pl", 0) for p in pos_dicts),
         equity=equity,
-        trade_date=datetime.now(UTC).date(),
+        trade_date=today,
         client=deps.llm_client,
     )
     await notify(summary)
@@ -312,6 +609,7 @@ async def daily_summary_job(
 async def healthcheck_job(
     deps: BotDeps,
     notify: NotifyFn,
+    state: BotState | None = None,
 ) -> None:
     """Ping Alpaca (get_clock) and notify if unreachable.
 
@@ -324,12 +622,177 @@ async def healthcheck_job(
     except asyncio.TimeoutError:
         logger.error("Healthcheck: Alpaca clock timeout")
         await notify("⚠️ ALERTA: Alpaca no respondió al healthcheck (timeout 5s).")
+        if state is not None:
+            state.last_error = "Alpaca healthcheck: timeout 5s"
+        return
     except Exception as exc:  # noqa: BLE001
         logger.error("Healthcheck: Alpaca error: {}", exc)
         await notify(f"⚠️ ALERTA: Error de conexión con Alpaca: {exc}")
+        if state is not None:
+            state.last_error = f"Alpaca healthcheck: {exc}"
+        return
+
+    if state is None or deps.stream_manager is None:
+        return
+    stream = deps.stream_manager
+    unhealthy: list[str] = []
+    if not stream.is_data_stream_running:
+        unhealthy.append("stream de datos detenido")
+    if not stream.is_trading_stream_running:
+        unhealthy.append("stream de órdenes detenido")
+    if state.market_state == "ACTIVE" and state.subscribed_symbols:
+        now = datetime.now(UTC)
+        stale = [
+            symbol
+            for symbol in state.subscribed_symbols
+            if symbol not in state.last_bar_at
+            or (now - state.last_bar_at[symbol]).total_seconds() > 300
+        ]
+        if stale:
+            unhealthy.append(f"sin barras recientes: {', '.join(sorted(stale))}")
+    if unhealthy:
+        message = "; ".join(unhealthy)
+        state.last_error = message
+        await notify(f"⚠️ ALERTA operativa: {message}")
+
+
+async def reconcile_order_attempts_job(
+    state: BotState,
+    deps: BotDeps,
+    notify: NotifyFn,
+) -> None:
+    """Recover order state after crashes between DB commit and API response."""
+    try:
+        async with deps.session_factory() as db:
+            attempts = (
+                await db.execute(
+                    select(OrderAttempt).where(
+                        OrderAttempt.status.in_(_NON_TERMINAL_ORDER_STATUSES)
+                    )
+                )
+            ).scalars().all()
+            for attempt in attempts:
+                if attempt.alpaca_order_id:
+                    order = await deps.alpaca.get_order(attempt.alpaca_order_id)
+                else:
+                    order = await deps.alpaca.get_order_by_client_id(
+                        attempt.client_order_id
+                    )
+                if order is None:
+                    continue
+                attempt.alpaca_order_id = order.alpaca_order_id
+                attempt.status = order.status
+                attempt.updated_at = datetime.now(UTC)
+                if order.status == "filled":
+                    existing_trade = (
+                        await db.execute(
+                            select(Trade).where(
+                                Trade.client_order_id == attempt.client_order_id
+                            )
+                        )
+                    ).scalars().first()
+                    if existing_trade is None:
+                        db.add(
+                            Trade(
+                                client_order_id=attempt.client_order_id,
+                                order_attempt_id=attempt.id,
+                                symbol=order.symbol,
+                                side=order.side.value,
+                                qty=order.filled_qty or order.qty,
+                                filled_price=order.filled_avg_price,
+                                order_type=attempt.order_type,
+                                status="filled",
+                                rule_trigger=attempt.rule_trigger,
+                                strategy_version_id=attempt.strategy_version_id,
+                                filled_at=order.filled_at or datetime.now(UTC),
+                            )
+                        )
+                        state.daily_trade_count += 1
+            await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        message = f"Order reconciliation failed: {exc}"
+        logger.error(message)
+        if state.last_error != message:
+            await notify(f"⚠️ {message}")
+        state.last_error = message
 
 
 # ── Bar event evaluation ───────────────────────────────────────────────────────
+
+
+async def _load_active_risk_overrides(
+    db_session: AsyncSession,
+    *,
+    now: datetime | None = None,
+) -> RiskOverrides:
+    """Load the newest non-expired override for every supported parameter."""
+    reference = now or datetime.now(UTC)
+    rows = (
+        await db_session.execute(
+            select(RiskOverride)
+            .where(RiskOverride.is_active.is_(True))
+            .order_by(RiskOverride.set_at.desc())
+        )
+    ).scalars().all()
+    values: dict[str, float | int] = {}
+    valid_fields = set(RiskOverrides.model_fields)
+    for row in rows:
+        if row.param_name not in valid_fields or row.param_name in values:
+            continue
+        expires_at = row.expires_at
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=UTC)
+            if expires_at <= reference:
+                continue
+        value: float | int = row.param_value
+        if row.param_name == "max_concurrent_positions":
+            value = int(value)
+        values[row.param_name] = value
+    return RiskOverrides.model_validate(values)
+
+
+async def _submit_persisted_order(
+    *,
+    intent: OrderIntent,
+    db_session: AsyncSession,
+    deps: BotDeps,
+    state: BotState,
+    notify: NotifyFn,
+) -> None:
+    """Commit the idempotency record before Alpaca, then persist its response."""
+    attempt = _make_order_attempt(intent)
+    db_session.add(attempt)
+    await db_session.commit()
+    try:
+        submission = await deps.alpaca.submit_order(intent)
+    except Exception as exc:
+        attempt.status = "failed_to_submit"
+        attempt.error_message = str(exc)[:500]
+        attempt.updated_at = datetime.now(UTC)
+        await db_session.commit()
+        message = f"Orden {intent.side.value} {intent.symbol} rechazada al enviar: {exc}"
+        state.last_error = message
+        await notify(f"⚠️ {message}")
+        raise
+
+    attempt.alpaca_order_id = submission.alpaca_order_id
+    attempt.status = submission.status
+    attempt.updated_at = datetime.now(UTC)
+    await db_session.commit()
+
+
+async def _record_risk_rejection(
+    *,
+    state: BotState,
+    notify: NotifyFn,
+    code: str,
+    reason: str,
+) -> None:
+    message = f"{code}: {reason}"
+    if state.last_risk_rejection != message:
+        await notify(f"🛡 Orden bloqueada por riesgo: {message}")
+    state.last_risk_rejection = message
 
 
 async def _evaluate_symbol(
@@ -358,14 +821,34 @@ async def _evaluate_symbol(
         calendar:  CalendarCache for risk_manager check 3.
     """
     try:
+        state.last_evaluation_at[symbol] = datetime.now(UTC)
+        state.condition_snapshots[symbol] = "; ".join(engine.explain_entry(bars))
         # ── Exit check ────────────────────────────────────────────────────────
         # Check exit first (reduce existing position before opening new one).
         positions = await deps.alpaca.get_positions()
         position = next((p for p in positions if p.symbol == symbol), None)
 
         if position is not None:
-            exit_signal = engine.evaluate_exit(symbol, bars, position)
+            latest_high = float(bars["high"].iloc[-1])
+            previous_high = state.position_highs.get(symbol, position.avg_entry_price)
+            position_high = max(previous_high, latest_high, position.avg_entry_price)
+            state.position_highs[symbol] = position_high
+            try:
+                from src.storage.runtime_state import persist_position_highs
+
+                async with deps.session_factory() as runtime_db:
+                    await persist_position_highs(runtime_db, state.position_highs)
+            except Exception as exc:  # noqa: BLE001
+                state.last_error = f"Failed to persist trailing peaks: {exc}"
+                logger.error("Failed to persist trailing peaks: {}", exc)
+            exit_signal = engine.evaluate_exit(
+                symbol,
+                bars,
+                position,
+                high_since_entry=position_high,
+            )
             if exit_signal is not None:
+                state.last_signal = f"SELL {symbol}: {exit_signal.reason}"
                 intent = OrderIntent(
                     symbol=symbol,
                     side=OrderSide.SELL,
@@ -376,10 +859,13 @@ async def _evaluate_symbol(
                     rule_trigger=exit_signal.reason,
                 )
                 async with deps.session_factory() as db_session:
+                    effective_overrides = overrides or await _load_active_risk_overrides(
+                        db_session
+                    )
                     result = await validate_order(
                         intent=intent,
                         strategy=state.active_strategy,
-                        overrides=overrides,
+                        overrides=effective_overrides,
                         alpaca=deps.alpaca,
                         asset_cache=deps.alpaca.asset_cache,
                         db_session=db_session,
@@ -387,22 +873,44 @@ async def _evaluate_symbol(
                         calendar=calendar,
                     )
                     if result.approved:
-                        attempt = _make_order_attempt(intent)
-                        db_session.add(attempt)
-                        await db_session.flush()
-                        await deps.alpaca.submit_order(intent)
+                        await _submit_persisted_order(
+                            intent=intent,
+                            db_session=db_session,
+                            deps=deps,
+                            state=state,
+                            notify=notify,
+                        )
                         msg = (
                             f"🔴 *SELL {symbol}* qty={intent.qty:.4g} "
                             f"({exit_signal.exit_type})\n"
                             f"_{exit_signal.reason}_"
                         )
                         await notify(msg)
+                    else:
+                        await db_session.commit()
+                        await _record_risk_rejection(
+                            state=state,
+                            notify=notify,
+                            code=result.code.value,
+                            reason=result.reason,
+                        )
                 return  # Don't also enter when we just exited
+        else:
+            if state.position_highs.pop(symbol, None) is not None:
+                try:
+                    from src.storage.runtime_state import persist_position_highs
+
+                    async with deps.session_factory() as runtime_db:
+                        await persist_position_highs(runtime_db, state.position_highs)
+                except Exception as exc:  # noqa: BLE001
+                    state.last_error = f"Failed to persist trailing peaks: {exc}"
+                    logger.error("Failed to persist trailing peaks: {}", exc)
 
         # ── Entry check ───────────────────────────────────────────────────────
         entry_signal = engine.evaluate_entry(symbol, bars)
         if entry_signal is None:
             return
+        state.last_signal = f"BUY {symbol}: {entry_signal.reason}"
 
         # Simple position sizing: use max_position_pct * portfolio equity
         account = await deps.alpaca.get_account()
@@ -411,8 +919,16 @@ async def _evaluate_symbol(
         # Use close price for quantity estimation
         last_price = float(bars["close"].iloc[-1])
         qty = target_value / last_price if last_price > 0 else 0
+        asset = await deps.alpaca.asset_cache.get(symbol)
+        if not asset.fractionable:
+            qty = float(int(qty))
+        else:
+            qty = round(qty, 9)
         if qty <= 0:
-            logger.warning("_evaluate_symbol: computed qty=0 for {} — skipping", symbol)
+            message = f"No se puede dimensionar {symbol}: capital objetivo menor a una acción"
+            logger.warning(message)
+            state.last_risk_rejection = message
+            await notify(f"🛡 {message}")
             return
 
         intent = OrderIntent(
@@ -426,10 +942,11 @@ async def _evaluate_symbol(
             estimated_price=last_price,
         )
         async with deps.session_factory() as db_session:
+            effective_overrides = overrides or await _load_active_risk_overrides(db_session)
             result = await validate_order(
                 intent=intent,
                 strategy=state.active_strategy,
-                overrides=overrides,
+                overrides=effective_overrides,
                 alpaca=deps.alpaca,
                 asset_cache=deps.alpaca.asset_cache,
                 db_session=db_session,
@@ -437,22 +954,36 @@ async def _evaluate_symbol(
                 calendar=calendar,
             )
             if result.approved:
-                attempt = _make_order_attempt(intent)
-                db_session.add(attempt)
-                await db_session.flush()
-                await deps.alpaca.submit_order(intent)
+                await _submit_persisted_order(
+                    intent=intent,
+                    db_session=db_session,
+                    deps=deps,
+                    state=state,
+                    notify=notify,
+                )
                 msg = (
                     f"🟢 *BUY {symbol}* qty={qty:.4g} @ ~${last_price:.2f}\n"
                     f"_{entry_signal.reason}_"
                 )
                 await notify(msg)
             else:
+                await db_session.commit()
                 logger.info(
                     "Entry blocked by risk check {}: {}", result.code.value, result.reason
+                )
+                await _record_risk_rejection(
+                    state=state,
+                    notify=notify,
+                    code=result.code.value,
+                    reason=result.reason,
                 )
 
     except Exception as exc:  # noqa: BLE001
         logger.error("_evaluate_symbol error for {}: {}", symbol, exc)
+        message = f"Evaluación de {symbol}: {exc}"
+        if state.last_error != message:
+            await notify(f"⚠️ Error en {message}")
+        state.last_error = message
 
 
 async def on_bar_event(
@@ -491,36 +1022,54 @@ async def on_bar_event(
         return
 
     symbol = bar_event.bar.symbol
+    if symbol not in state.active_strategy.universe:
+        return
+    state.last_bar_at[symbol] = bar_event.received_at
 
-    # Update in-memory bars cache with the new bar
-    new_row = pd.DataFrame(
-        [
-            {
-                "open": bar_event.bar.open,
-                "high": bar_event.bar.high,
-                "low": bar_event.bar.low,
-                "close": bar_event.bar.close,
-                "volume": bar_event.bar.volume,
-            }
-        ],
-        index=pd.DatetimeIndex([bar_event.bar.timestamp]),
+    event_date = bar_event.bar.timestamp.astimezone(ET).date()
+    market_day = (calendar or deps.calendar).get(event_date)
+    session_close = None
+    if market_day is not None:
+        session_close = (
+            market_day.session_close
+            if state.active_strategy.session == StrategySession.EXTENDED
+            else market_day.close
+        )
+    completed_bars = deps.bar_aggregator.push(
+        bar_event.bar,
+        state.active_strategy.timeframe,
+        state.active_strategy.session,
+        session_close=session_close,
     )
-    existing = deps.bars_cache.get(symbol, pd.DataFrame())
-    deps.bars_cache[symbol] = pd.concat([existing, new_row]).tail(
-        engine.required_lookback_bars() * 2
-    )
-    bars = deps.bars_cache[symbol]
-
-    await _evaluate_symbol(
-        symbol=symbol,
-        bars=bars,
-        state=state,
-        deps=deps,
-        notify=notify,
-        engine=engine,
-        overrides=overrides,
-        calendar=calendar,
-    )
+    for completed in completed_bars:
+        new_row = pd.DataFrame(
+            [
+                {
+                    "open": completed.open,
+                    "high": completed.high,
+                    "low": completed.low,
+                    "close": completed.close,
+                    "volume": completed.volume,
+                }
+            ],
+            index=pd.DatetimeIndex([completed.timestamp]),
+        )
+        existing = deps.bars_cache.get(symbol, pd.DataFrame())
+        if completed.timestamp in existing.index:
+            existing = existing.drop(index=completed.timestamp)
+        deps.bars_cache[symbol] = pd.concat([existing, new_row]).sort_index().tail(
+            engine.required_lookback_bars() * 2
+        )
+        await _evaluate_symbol(
+            symbol=symbol,
+            bars=deps.bars_cache[symbol],
+            state=state,
+            deps=deps,
+            notify=notify,
+            engine=engine,
+            overrides=overrides,
+            calendar=calendar,
+        )
 
 
 def _make_order_attempt(intent: OrderIntent) -> OrderAttempt:
@@ -549,13 +1098,14 @@ def create_scheduler(
     calendar: CalendarCache,
     *,
     warmup_minutes: int = 5,
+    eod_close_minutes_before: int = 5,
     summary_delay_minutes: int = 5,
     healthcheck_interval_minutes: int = 15,
 ) -> Any:
     """Build and return an AsyncIOScheduler with all jobs registered.
 
-    Jobs are scheduled for today's market session.  To handle the next day,
-    ``schedule_daily_jobs()`` must be called at midnight or at bot startup.
+    Market state is reconciled every 30 seconds, so session transitions survive
+    missed ticks, calendar refreshes, multi-day uptime, and mid-session restarts.
 
     Args:
         state:                       BotState instance.
@@ -563,6 +1113,7 @@ def create_scheduler(
         notify:                      Async callable to send Telegram messages.
         calendar:                    CalendarCache for today's session times.
         warmup_minutes:              How many minutes before open to run warmup_job.
+        eod_close_minutes_before:     Lead time for a close-all EOD policy.
         summary_delay_minutes:       How many minutes after close to run daily_summary_job.
         healthcheck_interval_minutes: Interval for the healthcheck job.
 
@@ -571,101 +1122,57 @@ def create_scheduler(
     """
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+    deps.calendar = calendar
     scheduler = AsyncIOScheduler()
 
-    # Healthcheck — runs every N minutes regardless of market state
+    # Healthcheck — runs every N minutes regardless of market state.
     scheduler.add_job(
         healthcheck_job,
         "interval",
         minutes=healthcheck_interval_minutes,
-        args=[deps, notify],
+        args=[deps, notify, state],
         id="healthcheck",
         replace_existing=True,
+        max_instances=1,
     )
 
-    # Schedule today's market session jobs
-    _schedule_session_jobs(
-        scheduler,
-        state=state,
-        deps=deps,
-        notify=notify,
-        calendar=calendar,
-        warmup_minutes=warmup_minutes,
-        summary_delay_minutes=summary_delay_minutes,
+    # Reconcile continuously instead of relying on one-shot jobs that disappear
+    # after the first session.
+    scheduler.add_job(
+        reconcile_market_state_job,
+        "interval",
+        seconds=30,
+        args=[state, deps, notify],
+        kwargs={
+            "warmup_minutes": warmup_minutes,
+            "eod_close_minutes_before": eod_close_minutes_before,
+            "summary_delay_minutes": summary_delay_minutes,
+        },
+        id="market_state_reconciler",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        refresh_calendar_job,
+        "interval",
+        hours=6,
+        args=[state, deps, notify],
+        id="calendar_refresh",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        reconcile_order_attempts_job,
+        "interval",
+        minutes=5,
+        args=[state, deps, notify],
+        id="order_reconciler",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
     )
 
+    logger.info("Recurring market reconciliation and calendar refresh scheduled")
     return scheduler
-
-
-def _schedule_session_jobs(
-    scheduler,
-    state: BotState,
-    deps: BotDeps,
-    notify: NotifyFn,
-    calendar: CalendarCache,
-    *,
-    warmup_minutes: int,
-    summary_delay_minutes: int,
-) -> None:
-    """Add today's warmup / open / close / summary jobs to the scheduler."""
-    from src.utils.market_hours import next_open, next_close
-
-    now = datetime.now(UTC)
-    open_time = next_open(now, calendar)
-    close_time = next_close(now, calendar)
-
-    if open_time is None or close_time is None:
-        logger.info("No trading session found in calendar; only healthcheck scheduled")
-        return
-
-    warmup_time = open_time - timedelta(minutes=warmup_minutes)
-    summary_time = close_time + timedelta(minutes=summary_delay_minutes)
-
-    if warmup_time > now:
-        scheduler.add_job(
-            warmup_job,
-            "date",
-            run_date=warmup_time,
-            args=[state, deps, notify],
-            kwargs={"warmup_minutes": warmup_minutes},
-            id="warmup",
-            replace_existing=True,
-        )
-
-    if open_time > now:
-        scheduler.add_job(
-            open_job,
-            "date",
-            run_date=open_time,
-            args=[state, notify],
-            id="open",
-            replace_existing=True,
-        )
-
-    if close_time > now:
-        scheduler.add_job(
-            close_job,
-            "date",
-            run_date=close_time,
-            args=[state, deps, notify],
-            id="close",
-            replace_existing=True,
-        )
-
-    if summary_time > now:
-        scheduler.add_job(
-            daily_summary_job,
-            "date",
-            run_date=summary_time,
-            args=[state, deps, notify],
-            id="daily_summary",
-            replace_existing=True,
-        )
-
-    logger.info(
-        "Session jobs scheduled: warmup={} open={} close={} summary={}",
-        warmup_time,
-        open_time,
-        close_time,
-        summary_time,
-    )

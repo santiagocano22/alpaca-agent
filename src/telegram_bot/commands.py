@@ -24,7 +24,7 @@ from src.broker.schemas import RiskOverrides
 from src.llm.strategy_parser import ParseError, parse_strategy
 from src.llm.summarizer import answer_ask
 from src.storage.models import RiskOverride
-from src.utils.market_hours import is_market_open
+from src.utils.market_hours import ET, is_market_open
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -42,6 +42,8 @@ _HELP_TEXT = """\
 /closeall — Cerrar todas las posiciones
 /ask <pregunta> — Consulta libre (usa IA)
 /setlimit <param> <valor> — Override de límite de riesgo
+/diagnostics — Estado de calendario, streams, barras y última evaluación
+/backtest [días] — Simular estrategia activa con históricos (30 días por defecto)
 /help — Este mensaje
 
 Parámetros válidos para /setlimit:
@@ -83,7 +85,14 @@ def _md(value: object) -> str:
     blocks.  Strategy names like ``etf_pullback_trend_filtered`` therefore
     break the parser.  This helper makes any dynamic value safe to embed.
     """
-    return str(value).replace("\\", "\\\\").replace("_", "\\_").replace("*", "\\*").replace("`", "\\`").replace("[", "\\[")
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("*", "\\*")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+    )
 
 
 # ── /start ────────────────────────────────────────────────────────────────────
@@ -283,40 +292,86 @@ async def handle_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     deps: BotDeps = context.bot_data["deps"]
 
     old_name = state.active_strategy.name if state.active_strategy else "ninguna"
-    state.active_strategy = state.pending_strategy
-    state.pending_strategy = None
-    state.pending_strategy_expires_at = None
-    state.pending_strategy_raw = ""
+    next_strategy = state.pending_strategy
+    raw_input = state.pending_strategy_raw
 
-    # Persist to DB so strategy survives restarts
+    # Persist first. If this transaction fails, the running strategy and its
+    # data subscriptions remain untouched and the pending proposal can be retried.
     from sqlalchemy import update as sa_update
 
     from src.storage.models import StrategyVersion
 
     try:
         async with deps.session_factory() as db:
-            # Deactivate previous active strategies
             await db.execute(
-                sa_update(StrategyVersion).where(StrategyVersion.is_active.is_(True)).values(is_active=False)
+                sa_update(StrategyVersion)
+                .where(StrategyVersion.is_active.is_(True))
+                .values(is_active=False, deactivated_at=now)
             )
-            # Save new strategy
-            new_version = StrategyVersion(
-                name=state.active_strategy.name,
-                parsed_config=state.active_strategy.model_dump(mode="json"),
-                raw_input=state.pending_strategy_raw or "",
-                is_active=True,
+            db.add(
+                StrategyVersion(
+                    name=next_strategy.name,
+                    parsed_config=next_strategy.model_dump(mode="json"),
+                    raw_input=raw_input,
+                    is_active=True,
+                    activated_at=now,
+                )
             )
-            db.add(new_version)
             await db.commit()
-        logger.info("Strategy '{}' persisted to DB", state.active_strategy.name)
+        logger.info("Strategy '{}' persisted to DB", next_strategy.name)
     except Exception as exc:  # noqa: BLE001
+        state.last_error = f"Failed to persist strategy: {exc}"
         logger.error("Failed to persist strategy to DB: {}", exc)
+        await _reply(
+            update,
+            context,
+            "❌ No se pudo guardar la estrategia; la estrategia activa no cambió. "
+            "Puedes volver a intentar /confirm.",
+        )
+        return
+
+    state.active_strategy = next_strategy
+    state.pending_strategy = None
+    state.pending_strategy_expires_at = None
+    state.pending_strategy_raw = ""
+
+    # A strategy change is also a market-data routing change. Never reuse bars
+    # from another timeframe/universe, and update the live subscriptions now.
+    deps.bars_cache.clear()
+    deps.bar_aggregator.reset()
+    subscription_notice = ""
+    if deps.stream_manager is not None:
+        try:
+            added, removed = await deps.stream_manager.replace_bar_symbols(
+                set(state.active_strategy.universe)
+            )
+            state.subscribed_symbols = deps.stream_manager.subscribed_symbols
+            logger.info(
+                "Strategy subscriptions updated: added={} removed={}",
+                sorted(added),
+                sorted(removed),
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.last_error = f"Failed to update subscriptions: {exc}"
+            logger.error("Failed to update strategy subscriptions: {}", exc)
+            subscription_notice = (
+                "\n⚠️ No se pudieron actualizar las suscripciones; "
+                "revisa /diagnostics."
+            )
+
+    if state.market_state in {"WARMUP", "ACTIVE"}:
+        from src.scheduler.jobs import preload_strategy_bars
+
+        loaded, total = await preload_strategy_bars(state, deps)
+        if loaded < total:
+            subscription_notice += f"\n⚠️ Warmup incompleto: {loaded}/{total} símbolos."
 
     await _reply(
         update, context,
         f"✅ Estrategia *{_md(state.active_strategy.name)}* activada.\n"
-        f"(Anterior: {_md(old_name)})\n\n"
-        f"⚠️ El engine recargará la suscripción de streams en el próximo ciclo.",
+        f"(Anterior: {_md(old_name)})\n"
+        f"Símbolos suscritos: {_md(', '.join(sorted(state.subscribed_symbols)) or 'ninguno')}"
+        f"{subscription_notice}",
         parse_mode="Markdown",
     )
 
@@ -349,14 +404,30 @@ async def handle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await _check_auth(update, context):
         return
 
-    from src.telegram_bot.bot import BotState
+    from src.storage.runtime_state import persist_bot_paused
+    from src.telegram_bot.bot import BotDeps, BotState
     state: BotState = context.bot_data["state"]
+    deps: BotDeps = context.bot_data["deps"]
 
     if state.bot_paused:
         await _reply(update, context, "⏸ El bot ya está pausado.")
         return
 
+    # Failing closed is safer: pause in memory even if persistence is degraded.
     state.bot_paused = True
+    try:
+        async with deps.session_factory() as db:
+            await persist_bot_paused(db, True)
+    except Exception as exc:  # noqa: BLE001
+        state.last_error = f"No se pudo persistir /pause: {exc}"
+        logger.error("Failed to persist paused state: {}", exc)
+        await _reply(
+            update,
+            context,
+            "⚠️ Bot pausado en memoria, pero no se pudo guardar el estado. "
+            "No lo reinicies hasta revisar la base de datos.",
+        )
+        return
     logger.info("Bot paused by Telegram user chat_id={}", update.effective_chat.id)
     await _reply(update, context, "⏸ Bot pausado. No se enviarán nuevas órdenes.\nUsa /resume para reanudar.")
 
@@ -368,13 +439,28 @@ async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await _check_auth(update, context):
         return
 
-    from src.telegram_bot.bot import BotState
+    from src.storage.runtime_state import persist_bot_paused
+    from src.telegram_bot.bot import BotDeps, BotState
     state: BotState = context.bot_data["state"]
+    deps: BotDeps = context.bot_data["deps"]
 
     if not state.bot_paused:
         await _reply(update, context, "▶️ El bot ya está activo.")
         return
 
+    # Persist before reopening the order gate. A DB failure leaves the bot paused.
+    try:
+        async with deps.session_factory() as db:
+            await persist_bot_paused(db, False)
+    except Exception as exc:  # noqa: BLE001
+        state.last_error = f"No se pudo persistir /resume: {exc}"
+        logger.error("Failed to persist resumed state: {}", exc)
+        await _reply(
+            update,
+            context,
+            "❌ No se pudo guardar la reanudación; el bot permanece pausado.",
+        )
+        return
     state.bot_paused = False
     logger.info("Bot resumed by Telegram user chat_id={}", update.effective_chat.id)
     await _reply(update, context, "▶️ Bot reanudado. Volviendo a ejecutar órdenes.")
@@ -553,6 +639,146 @@ async def handle_setlimit(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"_Activo hasta que se cambie o la estrategia se recargue._",
         parse_mode="Markdown",
     )
+
+
+# ── /diagnostics ─────────────────────────────────────────────────────────────
+
+
+async def handle_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _check_auth(update, context):
+        return
+
+    from src.telegram_bot.bot import BotDeps, BotState
+    from src.utils.market_hours import next_close, next_open
+
+    state: BotState = context.bot_data["state"]
+    deps: BotDeps = context.bot_data["deps"]
+    now = datetime.now(UTC)
+
+    def fmt(value: datetime | None) -> str:
+        return value.astimezone(ET).strftime("%Y-%m-%d %H:%M:%S %Z") if value else "nunca"
+
+    subscribed = sorted(state.subscribed_symbols)
+    bar_lines = []
+    for symbol in subscribed:
+        received = state.last_bar_at.get(symbol)
+        age = (now - received).total_seconds() if received else None
+        age_text = f"{age:.0f}s" if age is not None else "sin barras"
+        evaluated = state.last_evaluation_at.get(symbol)
+        snapshot = state.condition_snapshots.get(symbol, "sin evaluación")
+        bar_lines.append(
+            f"  {symbol}: barra={age_text}, evaluación={fmt(evaluated)}\n"
+            f"    condiciones: {_md(snapshot)}"
+        )
+
+    stream = deps.stream_manager
+    stream_status = (
+        f"datos={'up' if stream.is_data_stream_running else 'down'}, "
+        f"órdenes={'up' if stream.is_trading_stream_running else 'down'}"
+        if stream is not None
+        else "no configurado"
+    )
+    nxt_open = next_open(now, deps.calendar) if deps.calendar else None
+    nxt_close = next_close(now, deps.calendar) if deps.calendar else None
+    strategy = state.active_strategy
+    lines = [
+        "🔎 *Diagnóstico operativo*",
+        f"Estado: {state.market_state} | pausado={state.bot_paused}",
+        f"Estrategia: {_md(strategy.name if strategy else 'ninguna')}",
+        f"Timeframe: {strategy.timeframe.value if strategy else 'N/A'}",
+        f"Streams: {stream_status}",
+        f"Calendario actualizado: {fmt(state.last_calendar_refresh)}",
+        f"Próxima apertura: {fmt(nxt_open)}",
+        f"Próximo cierre: {fmt(nxt_close)}",
+        f"Suscripciones: {_md(', '.join(subscribed) or 'ninguna')}",
+    ]
+    lines.extend(bar_lines or ["  Sin símbolos suscritos"])
+    lines.extend(
+        [
+            f"Última señal: {_md(state.last_signal or 'ninguna')}",
+            f"Último bloqueo: {_md(state.last_risk_rejection or 'ninguno')}",
+            f"Último error: {_md(state.last_error or 'ninguno')}",
+        ]
+    )
+    await _reply(update, context, "\n".join(lines), parse_mode="Markdown")
+
+
+# ── /backtest ────────────────────────────────────────────────────────────────
+
+
+async def handle_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Run a historical simulation of the active strategy without placing orders."""
+    if not await _check_auth(update, context):
+        return
+
+    import asyncio
+
+    from src.backtest import BacktestConfig, format_backtest_report, run_backtest
+    from src.telegram_bot.bot import BotDeps, BotState
+
+    state: BotState = context.bot_data["state"]
+    deps: BotDeps = context.bot_data["deps"]
+    if state.active_strategy is None:
+        await _reply(update, context, "❌ No hay estrategia activa para simular.")
+        return
+    if state.backtest_running:
+        await _reply(update, context, "⏳ Ya hay una simulación en curso.")
+        return
+
+    args = context.args or []
+    try:
+        days = int(args[0]) if args else 30
+    except ValueError:
+        await _reply(update, context, "❌ Uso: /backtest [días], por ejemplo /backtest 30")
+        return
+    if not 5 <= days <= 730:
+        await _reply(update, context, "❌ El periodo debe estar entre 5 y 730 días.")
+        return
+
+    end_date = datetime.now(ET).date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=days - 1)
+    try:
+        account = await deps.alpaca.get_account()
+        initial_cash = account.portfolio_value
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Backtest: could not read account equity, using 100k: {}", exc)
+        initial_cash = 100_000.0
+
+    await _reply(
+        update,
+        context,
+        f"🧪 Simulación iniciada para {state.active_strategy.name}: "
+        f"{start_date} → {end_date}. No se enviarán órdenes.",
+    )
+    state.backtest_running = True
+
+    async def execute() -> None:
+        try:
+            result = await run_backtest(
+                state.active_strategy,
+                deps.alpaca,
+                BacktestConfig(
+                    start_date=start_date,
+                    end_date=end_date,
+                    initial_cash=initial_cash,
+                ),
+            )
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=format_backtest_report(result),
+            )
+        except Exception as exc:  # noqa: BLE001
+            state.last_error = f"Backtest failed: {exc}"
+            logger.exception("Backtest failed")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"❌ No se pudo completar la simulación: {exc}",
+            )
+        finally:
+            state.backtest_running = False
+            state.backtest_task = None
+
+    state.backtest_task = asyncio.create_task(execute(), name="telegram_backtest")
 
 
 # ── /help ─────────────────────────────────────────────────────────────────────

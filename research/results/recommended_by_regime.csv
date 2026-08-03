@@ -1,0 +1,3 @@
+regime,days,cumulative_return_pct,annualized_volatility_pct,mean_daily_return_bps
+SPY_above_SMA200,1320,38.697057657639135,6.6585384337376405,2.566707622757379
+SPY_at_or_below_SMA200,333,-3.8779224135895185,5.430945765323394,-1.1291840819773327

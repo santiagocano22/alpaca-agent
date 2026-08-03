@@ -1,0 +1,68 @@
+{
+  "name": "etf_pullback_trend_filtered",
+  "universe": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "XLK",
+    "XLF",
+    "XLI",
+    "XLV",
+    "XLY",
+    "XLE"
+  ],
+  "timeframe": "1D",
+  "session": "regular",
+  "horizon": "swing",
+  "eod_policy": "hold",
+  "entry_rules": {
+    "logic": "AND",
+    "conditions": [
+      {
+        "left": {"type": "price", "params": {}},
+        "op": ">",
+        "right": {"type": "sma", "params": {"period": 200}},
+        "lookback_bars": 1
+      },
+      {
+        "left": {"type": "ema", "params": {"period": 20}},
+        "op": ">",
+        "right": {"type": "ema", "params": {"period": 50}},
+        "lookback_bars": 1
+      },
+      {
+        "left": {"type": "rsi", "params": {"period": 14}},
+        "op": "crosses_above",
+        "right": 40.0,
+        "lookback_bars": 1
+      },
+      {
+        "left": {"type": "price", "params": {}},
+        "op": ">",
+        "right": {"type": "ema", "params": {"period": 20}},
+        "lookback_bars": 1
+      }
+    ]
+  },
+  "exit_rules": {
+    "take_profit_pct": null,
+    "stop_loss_pct": 6.0,
+    "trailing_stop_pct": 8.0,
+    "inverse_signal": {
+      "logic": "AND",
+      "conditions": [
+        {
+          "left": {"type": "price", "params": {}},
+          "op": "crosses_below",
+          "right": {"type": "ema", "params": {"period": 50}},
+          "lookback_bars": 1
+        }
+      ]
+    }
+  },
+  "position_sizing": {
+    "max_position_pct": 12.0,
+    "max_total_exposure_pct": 48.0,
+    "max_concurrent_positions": 4
+  }
+}

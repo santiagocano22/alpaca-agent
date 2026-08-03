@@ -64,6 +64,9 @@ class AlpacaStreamManager:
         self._trading_task: asyncio.Task | None = None
         self._data_task: asyncio.Task | None = None
         self._stopped = False
+        self.last_data_event_at: datetime | None = None
+        self.last_trade_event_at: datetime | None = None
+        self.last_error: str | None = None
 
     # ── Public subscription API ───────────────────────────────────────────────
 
@@ -78,6 +81,61 @@ class AlpacaStreamManager:
         syms = [s.upper() for s in symbols]
         self._subscribed_symbols.update(syms)
         self._ds.subscribe_bars(self._handle_bar, *syms)
+
+    async def update_bar_subscriptions(
+        self,
+        callback: BarCallback,
+        symbols: set[str] | list[str] | tuple[str, ...],
+    ) -> tuple[set[str], set[str]]:
+        """Replace the active bar universe without restarting the streams.
+
+        alpaca-py's subscription methods are synchronous and, while a stream
+        is running, submit a coroutine to its event loop and block for the
+        result.  Calling them directly from that same loop deadlocks, so live
+        updates are dispatched from a worker thread.
+        """
+        desired = {symbol.upper() for symbol in symbols}
+        removed = self._subscribed_symbols - desired
+        added = desired - self._subscribed_symbols
+        self._bar_callback = callback
+
+        if removed:
+            if getattr(self._ds, "_running", False):
+                await asyncio.to_thread(self._ds.unsubscribe_bars, *sorted(removed))
+            else:
+                self._ds.unsubscribe_bars(*sorted(removed))
+        if added:
+            if getattr(self._ds, "_running", False):
+                await asyncio.to_thread(
+                    self._ds.subscribe_bars,
+                    self._handle_bar,
+                    *sorted(added),
+                )
+            else:
+                self._ds.subscribe_bars(self._handle_bar, *sorted(added))
+
+        self._subscribed_symbols = desired
+        return added, removed
+
+    async def replace_bar_symbols(
+        self,
+        symbols: set[str] | list[str] | tuple[str, ...],
+    ) -> tuple[set[str], set[str]]:
+        if self._bar_callback is None:
+            raise RuntimeError("Bar callback must be registered before updating symbols")
+        return await self.update_bar_subscriptions(self._bar_callback, symbols)
+
+    @property
+    def subscribed_symbols(self) -> set[str]:
+        return set(self._subscribed_symbols)
+
+    @property
+    def is_data_stream_running(self) -> bool:
+        return self._data_task is not None and not self._data_task.done()
+
+    @property
+    def is_trading_stream_running(self) -> bool:
+        return self._trading_task is not None and not self._trading_task.done()
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -140,6 +198,7 @@ class AlpacaStreamManager:
                 if self._stopped:
                     return
                 logger.error("Trading stream error (reconnect {}): {}", reconnect, exc)
+                self.last_error = f"Trading stream: {exc}"
             else:
                 if self._stopped:
                     return
@@ -172,6 +231,7 @@ class AlpacaStreamManager:
                 if self._stopped:
                     return
                 logger.error("Data stream error (reconnect {}): {}", reconnect, exc)
+                self.last_error = f"Data stream: {exc}"
             else:
                 if self._stopped:
                     return
@@ -202,11 +262,13 @@ class AlpacaStreamManager:
     async def _handle_trade_update(self, tu: Any) -> None:
         if self._trade_callback is None:
             return
+        self.last_trade_event_at = datetime.now(UTC)
         await self._trade_callback(self._map_trade_update(tu))
 
     async def _handle_bar(self, bar: Any) -> None:
         if self._bar_callback is None:
             return
+        self.last_data_event_at = datetime.now(UTC)
         await self._bar_callback(self._map_bar(bar))
 
     # ── SDK → schema mappers ──────────────────────────────────────────────────

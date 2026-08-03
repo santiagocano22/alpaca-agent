@@ -15,7 +15,7 @@ Design:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Callable, Literal
 
 from telegram.ext import (
@@ -26,6 +26,7 @@ from telegram.ext import (
 
 from src.llm.client import LLMClient
 from src.strategy.schema import Strategy
+from src.strategy.timeframe import TimeframeAggregator
 from src.telegram_bot import commands
 
 
@@ -69,6 +70,31 @@ class BotState:
     daily_trade_count: int = 0
     daily_win_count: int = 0
 
+    # Operational diagnostics. These fields make silence distinguishable from
+    # a healthy strategy that simply has no signal.
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_calendar_refresh: datetime | None = None
+    last_bar_at: dict[str, datetime] = field(default_factory=dict)
+    last_evaluation_at: dict[str, datetime] = field(default_factory=dict)
+    condition_snapshots: dict[str, str] = field(default_factory=dict)
+    last_signal: str | None = None
+    last_risk_rejection: str | None = None
+    last_error: str | None = None
+    subscribed_symbols: set[str] = field(default_factory=set)
+    position_highs: dict[str, float] = field(default_factory=dict)
+    """Highest observed bar price per open position for trailing stops."""
+
+    backtest_running: bool = False
+    """Prevents multiple historical simulations from running concurrently."""
+
+    backtest_task: Any | None = None
+    """Background asyncio task for the current Telegram backtest, if any."""
+
+    # Idempotency markers for recurring market-state reconciliation.
+    last_eod_liquidation_date: date | None = None
+    last_summary_date: date | None = None
+    last_holiday_notice_date: date | None = None
+
 
 # ── BotDeps ───────────────────────────────────────────────────────────────────
 
@@ -98,6 +124,15 @@ class BotDeps:
 
     bars_cache: dict = field(default_factory=dict)
     """Per-symbol rolling DataFrame of historical bars used by the strategy engine."""
+
+    bar_aggregator: TimeframeAggregator = field(default_factory=TimeframeAggregator)
+    """Aggregates Alpaca minute bars into the active strategy timeframe."""
+
+    stream_manager: Any | None = None
+    """AlpacaStreamManager, attached during startup for hot subscription updates."""
+
+    calendar: dict = field(default_factory=dict)
+    """Mutable market calendar shared by scheduler, commands, and risk checks."""
 
 
 # ── Application factory ───────────────────────────────────────────────────────
@@ -136,6 +171,8 @@ def create_application(
     app.add_handler(CommandHandler("closeall", commands.handle_closeall))
     app.add_handler(CommandHandler("ask", commands.handle_ask))
     app.add_handler(CommandHandler("setlimit", commands.handle_setlimit))
+    app.add_handler(CommandHandler("diagnostics", commands.handle_diagnostics))
+    app.add_handler(CommandHandler("backtest", commands.handle_backtest))
     app.add_handler(CommandHandler("help", commands.handle_help))
 
     return app

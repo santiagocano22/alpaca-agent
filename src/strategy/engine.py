@@ -149,13 +149,19 @@ def _eval_condition(cond: Condition, bars: pd.DataFrame) -> bool:
     if op in (ComparisonOp.CROSSES_ABOVE, ComparisonOp.CROSSES_BELOW):
         if len(bars) < 2:
             return False
-        l_cur, l_prev = left_s.iloc[-1], left_s.iloc[-2]
-        r_cur, r_prev = right_s.iloc[-1], right_s.iloc[-2]
-        if any(pd.isna(v) for v in (l_cur, l_prev, r_cur, r_prev)):
-            return False
-        if op == ComparisonOp.CROSSES_ABOVE:
-            return bool(l_prev <= r_prev and l_cur > r_cur)
-        return bool(l_prev >= r_prev and l_cur < r_cur)
+        transitions = min(cond.lookback_bars, len(bars) - 1)
+        for back in range(1, transitions + 1):
+            cur_idx = -back
+            prev_idx = cur_idx - 1
+            l_cur, l_prev = left_s.iloc[cur_idx], left_s.iloc[prev_idx]
+            r_cur, r_prev = right_s.iloc[cur_idx], right_s.iloc[prev_idx]
+            if any(pd.isna(v) for v in (l_cur, l_prev, r_cur, r_prev)):
+                continue
+            if op == ComparisonOp.CROSSES_ABOVE and l_prev <= r_prev and l_cur > r_cur:
+                return True
+            if op == ComparisonOp.CROSSES_BELOW and l_prev >= r_prev and l_cur < r_cur:
+                return True
+        return False
 
     l_val = left_s.iloc[-1]
     r_val = right_s.iloc[-1]
@@ -190,7 +196,10 @@ def _eval_group(group: RuleGroup, bars: pd.DataFrame) -> bool:
 def _desc_val(v: Union[IndicatorRef, float]) -> str:
     if isinstance(v, (int, float)):
         return str(v)
-    return f"{v.type.value}({v.params})"
+    if not v.params:
+        return v.type.value
+    params = ", ".join(f"{key}={value}" for key, value in v.params.items())
+    return f"{v.type.value}({params})"
 
 
 def _desc_condition(c: Condition) -> str:
@@ -257,8 +266,55 @@ class StrategyEngine:
         logger.debug("Entry signal for {}: {}", symbol, reason)
         return EntrySignal(symbol=symbol, reason=reason, bar_timestamp=bar_ts)
 
+    def explain_entry(self, bars: pd.DataFrame) -> list[str]:
+        """Return current values and outcomes for every atomic entry condition."""
+        self._check_history(bars)
+        snapshots: list[str] = []
+
+        def walk(node: Union[RuleGroup, Condition]) -> None:
+            if isinstance(node, RuleGroup):
+                for child in node.conditions:
+                    walk(child)
+                return
+            left = _as_series(node.left, bars).iloc[-1]
+            right = _as_series(node.right, bars).iloc[-1]
+            outcome = _eval_condition(node, bars)
+            left_text = "NaN" if pd.isna(left) else f"{float(left):.6g}"
+            right_text = "NaN" if pd.isna(right) else f"{float(right):.6g}"
+            snapshots.append(
+                f"{_desc_val(node.left)}={left_text} {node.op.value} "
+                f"{_desc_val(node.right)}={right_text} → {outcome}"
+            )
+
+        walk(self._strategy.entry_rules)
+        return snapshots
+
+    def entry_condition_outcomes(self, bars: pd.DataFrame) -> list[tuple[str, bool]]:
+        """Return stable condition labels and their current boolean outcomes.
+
+        Unlike :meth:`explain_entry`, labels do not contain changing indicator
+        values, which makes this suitable for aggregating backtest diagnostics.
+        """
+        self._check_history(bars)
+        outcomes: list[tuple[str, bool]] = []
+
+        def walk(node: Union[RuleGroup, Condition]) -> None:
+            if isinstance(node, RuleGroup):
+                for child in node.conditions:
+                    walk(child)
+                return
+            outcomes.append((_desc_condition(node), _eval_condition(node, bars)))
+
+        walk(self._strategy.entry_rules)
+        return outcomes
+
     def evaluate_exit(
-        self, symbol: str, bars: pd.DataFrame, position: PositionSnapshot
+        self,
+        symbol: str,
+        bars: pd.DataFrame,
+        position: PositionSnapshot,
+        *,
+        high_since_entry: float | None = None,
     ) -> ExitSignal | None:
         """Evaluate exit rules against the last bar of ``bars``.
 
@@ -303,13 +359,17 @@ class StrategyEngine:
 
         # 3. Trailing stop
         if er.trailing_stop_pct is not None:
-            high_since_entry = float(bars["high"].max())
-            trail_price = high_since_entry * (1.0 - er.trailing_stop_pct / 100.0)
+            peak = (
+                high_since_entry
+                if high_since_entry is not None
+                else float(bars["high"].max())
+            )
+            trail_price = peak * (1.0 - er.trailing_stop_pct / 100.0)
             if current_price <= trail_price:
                 reason = (
                     f"Trailing stop triggered: close {current_price:.4f} ≤ "
                     f"trail {trail_price:.4f} "
-                    f"(peak {high_since_entry:.4f} - {er.trailing_stop_pct}%)"
+                    f"(peak {peak:.4f} - {er.trailing_stop_pct}%)"
                 )
                 logger.debug("Exit[trailing_stop] for {}: {}", symbol, reason)
                 return ExitSignal(
